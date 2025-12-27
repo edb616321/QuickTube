@@ -1,6 +1,6 @@
 """
-QuickTube - Simple YouTube Downloader
-Paste URL, download video or channel - that's it!
+QuickTube - YouTube Downloader with Search
+Paste URL, search for music, or download entire channels.
 Includes codec detection and conversion for maximum compatibility.
 """
 
@@ -10,10 +10,33 @@ import json
 import threading
 import subprocess
 import re
+import socket
+import sqlite3
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 import pyperclip
 from tkinter import messagebox
+from typing import List, Dict, Optional
+from io import BytesIO
+import urllib.request
+
+# For thumbnail display
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("[QuickTube] Warning: PIL not available, thumbnails disabled")
+
+# For automated YouTube login
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    print("[QuickTube] Warning: Playwright not available, manual login required")
 
 # Import codec utilities for compatibility checking
 try:
@@ -31,6 +54,8 @@ DOWNLOAD_FOLDER = r"D:\stacher_downloads"
 TEMP_FOLDER = r"D:\QuickTube\temp"
 SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "download_history.json"
+POT_SERVER_PATH = r"D:\QuickTube\pot-provider\server"
+POT_SERVER_PORT = 4416
 
 # Colors - Match CCL theme
 COLORS = {
@@ -60,6 +85,10 @@ class QuickTubeApp(ctk.CTk):
         self.download_queue = []
         self.current_download = None
         self.is_downloading = False
+        self.search_results: List[Dict] = []
+        self.search_checkboxes: Dict[str, ctk.CTkCheckBox] = {}
+        self.search_vars: Dict[str, ctk.BooleanVar] = {}
+        self.thumbnail_cache: Dict[str, any] = {}  # Cache for thumbnail images
 
         # Load settings and history
         self.settings = self.load_settings()
@@ -67,6 +96,13 @@ class QuickTubeApp(ctk.CTk):
 
         # Ensure temp folder exists
         os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+        # Auto-refresh cookies from Firefox on startup
+        self._refresh_firefox_cookies()
+
+        # Start POT server if not running (for YouTube bot detection bypass)
+        self.pot_server_process = None
+        self._ensure_pot_server()
 
         # Create UI
         self.create_ui()
@@ -76,6 +112,268 @@ class QuickTubeApp(ctk.CTk):
 
         # Protocol for window close
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _is_pot_server_running(self) -> bool:
+        """Check if POT server is running on the configured port"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                result = s.connect_ex(('127.0.0.1', POT_SERVER_PORT))
+                return result == 0
+        except:
+            return False
+
+    def _ensure_pot_server(self):
+        """Start POT server if not already running"""
+        if self._is_pot_server_running():
+            print("[QuickTube] POT server already running on port", POT_SERVER_PORT)
+            return
+
+        server_script = os.path.join(POT_SERVER_PATH, "build", "main.js")
+        if not os.path.exists(server_script):
+            print("[QuickTube] Warning: POT server not found. Some YouTube downloads may fail.")
+            print(f"[QuickTube] Expected: {server_script}")
+            return
+
+        try:
+            # Start POT server in background
+            print("[QuickTube] Starting POT server...")
+            self.pot_server_process = subprocess.Popen(
+                ["node", server_script],
+                cwd=POT_SERVER_PATH,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+            # Wait briefly for server to start
+            import time
+            time.sleep(2)
+            if self._is_pot_server_running():
+                print("[QuickTube] POT server started successfully on port", POT_SERVER_PORT)
+            else:
+                print("[QuickTube] Warning: POT server may not have started properly")
+        except Exception as e:
+            print(f"[QuickTube] Warning: Could not start POT server: {e}")
+
+    def _check_youtube_login(self) -> bool:
+        """Check if user is logged into YouTube in Firefox"""
+        try:
+            # Run yt-dlp to check for YouTube auth cookies
+            result = subprocess.run(
+                ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json",
+                 "--skip-download", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+                capture_output=True, text=True, timeout=30
+            )
+            # If it succeeds without bot detection error, we're logged in
+            return result.returncode == 0 and "Sign in to confirm" not in result.stderr
+        except:
+            return False
+
+    def _prompt_youtube_login(self):
+        """Use Playwright to automate YouTube login"""
+        if not PLAYWRIGHT_AVAILABLE:
+            # Fallback to manual login
+            self._manual_youtube_login()
+            return
+
+        # Show starting message
+        messagebox.showinfo(
+            "YouTube Login",
+            "A browser window will open for YouTube login.\n\n"
+            "The email will be filled automatically.\n"
+            "You may need to:\n"
+            "- Enter your password\n"
+            "- Complete any verification (2FA, CAPTCHA)\n\n"
+            "The window will close automatically when done."
+        )
+
+        try:
+            # Run Playwright login in a thread to not block UI
+            thread = threading.Thread(target=self._playwright_youtube_login)
+            thread.start()
+            thread.join(timeout=300)  # 5 minute timeout
+        except Exception as e:
+            messagebox.showerror("Login Error", f"Failed to open browser: {e}")
+
+    def _playwright_youtube_login(self):
+        """Perform YouTube login using Playwright"""
+        # Firefox profile path for persistent cookies
+        firefox_profile = os.path.join(os.path.expanduser("~"),
+            "AppData", "Roaming", "Mozilla", "Firefox", "Profiles")
+
+        # Find the default profile
+        profile_dir = None
+        if os.path.exists(firefox_profile):
+            for folder in os.listdir(firefox_profile):
+                if folder.endswith(".default-release") or folder.endswith(".default"):
+                    profile_dir = os.path.join(firefox_profile, folder)
+                    break
+
+        try:
+            with sync_playwright() as p:
+                # Launch Firefox with persistent context to save cookies
+                browser = p.firefox.launch(headless=False)
+                context = browser.new_context()
+                page = context.new_page()
+
+                # Navigate to YouTube login
+                page.goto("https://accounts.google.com/signin/v2/identifier?service=youtube")
+                page.wait_for_load_state("networkidle")
+
+                # Fill in email
+                email_input = page.locator('input[type="email"]')
+                if email_input.is_visible():
+                    email_input.fill("joeb00399@gmail.com")
+                    page.click('button:has-text("Next")')
+                    page.wait_for_timeout(2000)
+
+                # Wait for password field
+                password_input = page.locator('input[type="password"]')
+                if password_input.is_visible(timeout=10000):
+                    password_input.fill("#CLSadmin09")
+                    page.click('button:has-text("Next")')
+
+                # Wait for login to complete or user to handle 2FA
+                # Check for YouTube homepage or profile icon
+                try:
+                    page.wait_for_url("*youtube.com*", timeout=120000)  # 2 min for 2FA
+                    page.wait_for_timeout(3000)  # Extra time to ensure cookies are set
+                except:
+                    pass  # User may have closed browser
+
+                # Export cookies to Firefox profile format
+                cookies = context.cookies()
+                self._save_cookies_to_firefox(cookies)
+
+                browser.close()
+
+        except Exception as e:
+            print(f"[QuickTube] Playwright login error: {e}")
+
+    def _save_cookies_to_firefox(self, cookies):
+        """Save Playwright cookies in a format yt-dlp can use"""
+        # Save cookies to a Netscape format file for yt-dlp
+        cookies_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
+        os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+        with open(cookies_file, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for cookie in cookies:
+                domain = cookie.get('domain', '')
+                if not domain.startswith('.'):
+                    domain = '.' + domain
+                flag = "TRUE" if domain.startswith('.') else "FALSE"
+                path = cookie.get('path', '/')
+                secure = "TRUE" if cookie.get('secure', False) else "FALSE"
+                expires = str(int(cookie.get('expires', 0)))
+                name = cookie.get('name', '')
+                value = cookie.get('value', '')
+                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+        # Update settings to use cookie file
+        self.settings["cookies_file"] = cookies_file
+        self.save_settings()
+
+    def _manual_youtube_login(self):
+        """Fallback manual login if Playwright not available"""
+        firefox_path = self._find_firefox()
+        if firefox_path:
+            subprocess.Popen([firefox_path, "https://www.youtube.com"])
+        else:
+            import webbrowser
+            webbrowser.open("https://www.youtube.com")
+
+        messagebox.showinfo(
+            "YouTube Login Required",
+            "Firefox has been opened to YouTube.\n\n"
+            "Please:\n"
+            "1. Sign in to your Google/YouTube account\n"
+            "2. Play any video to confirm you're logged in\n"
+            "3. Come back here and try downloading again\n\n"
+            "This is a one-time setup - your login will be remembered."
+        )
+
+    def _find_firefox(self) -> str:
+        """Find Firefox executable path"""
+        possible_paths = [
+            r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Mozilla Firefox\firefox.exe"),
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _ensure_youtube_login(self) -> bool:
+        """Ensure user is logged into YouTube, prompt if not"""
+        if self._check_youtube_login():
+            return True
+
+        self._prompt_youtube_login()
+
+        # Check again after login attempt
+        import time
+        time.sleep(2)
+        return self._check_youtube_login()
+
+    def _refresh_firefox_cookies(self):
+        """Auto-refresh cookies from Firefox on startup"""
+        try:
+            # Find Firefox profile with cookies
+            profiles_dir = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
+            if not os.path.exists(profiles_dir):
+                return
+
+            profile_dir = None
+            for folder in os.listdir(profiles_dir):
+                full_path = os.path.join(profiles_dir, folder)
+                if os.path.isdir(full_path) and os.path.exists(os.path.join(full_path, 'cookies.sqlite')):
+                    profile_dir = full_path
+                    break
+
+            if not profile_dir:
+                return
+
+            # Copy and read cookies database
+            cookies_db = os.path.join(profile_dir, 'cookies.sqlite')
+            temp_db = os.path.join(tempfile.gettempdir(), 'firefox_cookies_copy.sqlite')
+            shutil.copy2(cookies_db, temp_db)
+
+            conn = sqlite3.connect(temp_db)
+            cursor = conn.cursor()
+            cursor.execute("SELECT host, name, value, path, expiry, isSecure FROM moz_cookies")
+            cookies = cursor.fetchall()
+            conn.close()
+            os.remove(temp_db)
+
+            # Write cookies file
+            cookies_file = os.path.join(TEMP_FOLDER, 'youtube_cookies.txt')
+            with open(cookies_file, 'w') as f:
+                f.write('# Netscape HTTP Cookie File\n')
+                for host, name, value, path, expiry, is_secure in cookies:
+                    if not host.startswith('.') and not host.startswith('www'):
+                        host = '.' + host
+                    flag = 'TRUE' if host.startswith('.') else 'FALSE'
+                    secure = 'TRUE' if is_secure else 'FALSE'
+                    if expiry and expiry > 32503680000:
+                        expiry = expiry // 1000
+                    expiry_str = str(int(expiry)) if expiry else '0'
+                    f.write(f'{host}\t{flag}\t{path}\t{secure}\t{expiry_str}\t{name}\t{value}\n')
+
+            self.settings['cookies_file'] = cookies_file
+            self.save_settings()
+            print(f"[QuickTube] Refreshed {len(cookies)} cookies from Firefox")
+
+        except Exception as e:
+            print(f"[QuickTube] Cookie refresh failed: {e}")
+
+    def _get_cookie_args(self) -> list:
+        """Get the appropriate cookie arguments for yt-dlp"""
+        cookies_file = self.settings.get("cookies_file")
+        if cookies_file and os.path.exists(cookies_file):
+            return ["--cookies", cookies_file]
+        return ["--cookies-from-browser", "firefox"]
 
     def load_settings(self):
         """Load settings from JSON file"""
@@ -87,6 +385,7 @@ class QuickTubeApp(ctk.CTk):
             "check_compatibility": True,  # Check codecs after download
             "auto_convert": False,  # Auto-convert incompatible files
             "prefer_h264": True,  # Prefer H.264 codec when downloading
+            "browser": "firefox",  # Browser for cookies: firefox recommended (chrome/edge have DPAPI issues)
         }
 
         if os.path.exists(SETTINGS_FILE):
@@ -153,9 +452,53 @@ class QuickTubeApp(ctk.CTk):
         )
         folder_label.pack(side="left", padx=10, pady=10)
 
+        # Tab buttons
+        tab_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tab_frame.pack(fill="x", padx=20, pady=(5, 0))
+
+        self.url_tab_btn = ctk.CTkButton(
+            tab_frame,
+            text="📋 URL Download",
+            command=lambda: self.switch_tab("url"),
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 14, "bold"),
+            width=150,
+            height=40
+        )
+        self.url_tab_btn.pack(side="left", padx=5)
+
+        self.search_tab_btn = ctk.CTkButton(
+            tab_frame,
+            text="🔍 Search Music",
+            command=lambda: self.switch_tab("search"),
+            fg_color=COLORS["card_bg"],
+            hover_color=COLORS["card_hover"],
+            font=("Arial", 14, "bold"),
+            width=150,
+            height=40
+        )
+        self.search_tab_btn.pack(side="left", padx=5)
+
+        # Container for tab content
+        self.tab_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.tab_container.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # Create both tab frames
+        self._create_url_tab()
+        self._create_search_tab()
+
+        # Show URL tab by default
+        self.current_tab = "url"
+        self.url_tab_frame.pack(fill="both", expand=True)
+
+    def _create_url_tab(self):
+        """Create the URL download tab"""
+        self.url_tab_frame = ctk.CTkFrame(self.tab_container, fg_color="transparent")
+
         # URL Input section
-        input_frame = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=10)
-        input_frame.pack(fill="x", padx=20, pady=10)
+        input_frame = ctk.CTkFrame(self.url_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        input_frame.pack(fill="x", pady=10)
 
         # URL label with folder button
         url_header = ctk.CTkFrame(input_frame, fg_color="transparent")
@@ -241,9 +584,9 @@ class QuickTubeApp(ctk.CTk):
         )
         clear_btn.pack(side="left", padx=10)
 
-        # Progress section
-        progress_frame = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=10)
-        progress_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        # Progress section (shared between tabs) - in URL tab
+        progress_frame = ctk.CTkFrame(self.url_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        progress_frame.pack(fill="both", expand=True, pady=10)
 
         progress_title = ctk.CTkLabel(
             progress_frame,
@@ -259,16 +602,16 @@ class QuickTubeApp(ctk.CTk):
             font=("Courier New", 11),
             fg_color=COLORS["progress_bg"],
             wrap="word",
-            height=300
+            height=200
         )
         self.progress_display.pack(fill="both", expand=True, padx=15, pady=(5, 10))
 
         # History section
-        history_frame = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=10)
-        history_frame.pack(fill="x", padx=20, pady=10)
+        history_container = ctk.CTkFrame(self.url_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        history_container.pack(fill="x", pady=10)
 
         history_title = ctk.CTkLabel(
-            history_frame,
+            history_container,
             text="📝 Recent Downloads",
             font=("Arial", 16, "bold"),
             text_color=COLORS["text"]
@@ -276,53 +619,611 @@ class QuickTubeApp(ctk.CTk):
         history_title.pack(anchor="w", padx=15, pady=(10, 5))
 
         self.history_frame = ctk.CTkScrollableFrame(
-            history_frame,
+            history_container,
             fg_color=COLORS["progress_bg"],
-            height=200
+            height=120
         )
         self.history_frame.pack(fill="both", padx=10, pady=(0, 10))
 
         self.update_history_display()
 
-        # Bottom buttons
-        bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
-        bottom_frame.pack(fill="x", padx=20, pady=(0, 20))
+    def _create_search_tab(self):
+        """Create the search tab for finding music"""
+        self.search_tab_frame = ctk.CTkFrame(self.tab_container, fg_color="transparent")
 
-        open_folder_btn = ctk.CTkButton(
-            bottom_frame,
-            text="📁 Open Downloads Folder",
-            command=self.open_download_folder,
+        # Search input section
+        search_input_frame = ctk.CTkFrame(self.search_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        search_input_frame.pack(fill="x", pady=10)
+
+        search_header = ctk.CTkFrame(search_input_frame, fg_color="transparent")
+        search_header.pack(fill="x", padx=20, pady=(15, 10))
+
+        search_label = ctk.CTkLabel(
+            search_header,
+            text="🔍 Search YouTube for Music:",
+            font=("Arial", 16, "bold"),
+            text_color=COLORS["text"]
+        )
+        search_label.pack(side="left")
+
+        # Search entry
+        search_entry_frame = ctk.CTkFrame(search_input_frame, fg_color="transparent")
+        search_entry_frame.pack(fill="x", padx=20, pady=(0, 15))
+
+        self.search_entry = ctk.CTkEntry(
+            search_entry_frame,
+            font=("Arial", 14),
+            height=45,
+            placeholder_text="Enter genre, artist, or song (e.g., 'jazz music', '80s rock', 'chill lofi')"
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.search_entry.bind("<Return>", lambda e: self.search_youtube())
+
+        search_btn = ctk.CTkButton(
+            search_entry_frame,
+            text="🔍 Search",
+            command=self.search_youtube,
             fg_color=COLORS["accent"],
             hover_color=COLORS["accent_hover"],
             font=("Arial", 14, "bold"),
-            width=200,
-            height=40
+            width=120,
+            height=45
         )
-        open_folder_btn.pack(side="left", padx=5)
+        search_btn.pack(side="right")
 
-        settings_btn = ctk.CTkButton(
-            bottom_frame,
-            text="⚙️ Settings",
-            command=self.open_settings,
+        # Quick genre buttons
+        genre_frame = ctk.CTkFrame(search_input_frame, fg_color="transparent")
+        genre_frame.pack(fill="x", padx=20, pady=(0, 15))
+
+        genre_label = ctk.CTkLabel(
+            genre_frame,
+            text="Quick search:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        )
+        genre_label.pack(side="left", padx=(0, 10))
+
+        genres = ["Jazz", "Rock", "Classical", "Lo-Fi", "80s Hits", "Blues", "Country", "Electronic"]
+        for genre in genres:
+            btn = ctk.CTkButton(
+                genre_frame,
+                text=genre,
+                command=lambda g=genre: self._quick_search(g),
+                fg_color=COLORS["card_bg"],
+                hover_color=COLORS["card_hover"],
+                font=("Arial", 11),
+                width=80,
+                height=30
+            )
+            btn.pack(side="left", padx=2)
+
+        # Results section (don't expand - leave room for progress)
+        results_frame = ctk.CTkFrame(self.search_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        results_frame.pack(fill="x", pady=10)
+
+        results_header = ctk.CTkFrame(results_frame, fg_color="transparent")
+        results_header.pack(fill="x", padx=15, pady=(10, 5))
+
+        self.results_label = ctk.CTkLabel(
+            results_header,
+            text="📋 Search Results (select videos to download):",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["text"]
+        )
+        self.results_label.pack(side="left")
+
+        # Select all / None buttons
+        select_frame = ctk.CTkFrame(results_header, fg_color="transparent")
+        select_frame.pack(side="right")
+
+        select_all_btn = ctk.CTkButton(
+            select_frame,
+            text="Select All",
+            command=self._select_all_results,
             fg_color=COLORS["card_bg"],
             hover_color=COLORS["card_hover"],
-            font=("Arial", 14, "bold"),
-            width=150,
-            height=40
+            font=("Arial", 11),
+            width=80,
+            height=25
         )
-        settings_btn.pack(side="left", padx=5)
+        select_all_btn.pack(side="left", padx=2)
 
-        close_btn = ctk.CTkButton(
-            bottom_frame,
-            text="❌ Close",
-            command=self.on_closing,
-            fg_color=COLORS["error"],
-            hover_color="#CC0000",
-            font=("Arial", 14, "bold"),
-            width=150,
-            height=40
+        select_none_btn = ctk.CTkButton(
+            select_frame,
+            text="Select None",
+            command=self._select_none_results,
+            fg_color=COLORS["card_bg"],
+            hover_color=COLORS["card_hover"],
+            font=("Arial", 11),
+            width=80,
+            height=25
         )
-        close_btn.pack(side="right", padx=5)
+        select_none_btn.pack(side="left", padx=2)
+
+        # Results list (scrollable with fixed height)
+        self.results_scroll = ctk.CTkScrollableFrame(
+            results_frame,
+            fg_color=COLORS["progress_bg"],
+            height=280
+        )
+        self.results_scroll.pack(fill="x", padx=10, pady=(5, 10))
+
+        # Placeholder text
+        self.results_placeholder = ctk.CTkLabel(
+            self.results_scroll,
+            text="Enter a search term and click Search to find videos",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        )
+        self.results_placeholder.pack(pady=50)
+
+        # Download button
+        download_frame = ctk.CTkFrame(self.search_tab_frame, fg_color="transparent")
+        download_frame.pack(fill="x", pady=10)
+
+        self.download_selected_btn = ctk.CTkButton(
+            download_frame,
+            text="⬇️ Download Selected (0)",
+            command=self.download_selected,
+            fg_color=COLORS["success"],
+            hover_color="#00AA55",
+            font=("Arial", 16, "bold"),
+            width=250,
+            height=50,
+            state="disabled"
+        )
+        self.download_selected_btn.pack(side="left", padx=10)
+
+        # Search progress display (larger for detailed output)
+        progress_frame = ctk.CTkFrame(self.search_tab_frame, fg_color=COLORS["bg_dark"])
+        progress_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        progress_label = ctk.CTkLabel(
+            progress_frame,
+            text="Download Progress:",
+            font=("Arial", 12, "bold"),
+            text_color=COLORS["text"]
+        )
+        progress_label.pack(anchor="w", padx=10)
+
+        self.search_progress = ctk.CTkTextbox(
+            progress_frame,
+            font=("Courier New", 10),
+            fg_color=COLORS["progress_bg"],
+            wrap="word",
+            height=200
+        )
+        self.search_progress.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+    def switch_tab(self, tab_name: str):
+        """Switch between URL and Search tabs"""
+        if tab_name == self.current_tab:
+            return
+
+        # Hide current tab
+        if self.current_tab == "url":
+            self.url_tab_frame.pack_forget()
+            self.url_tab_btn.configure(fg_color=COLORS["card_bg"])
+        else:
+            self.search_tab_frame.pack_forget()
+            self.search_tab_btn.configure(fg_color=COLORS["card_bg"])
+
+        # Show new tab
+        if tab_name == "url":
+            self.url_tab_frame.pack(fill="both", expand=True)
+            self.url_tab_btn.configure(fg_color=COLORS["accent"])
+        else:
+            self.search_tab_frame.pack(fill="both", expand=True)
+            self.search_tab_btn.configure(fg_color=COLORS["accent"])
+
+        self.current_tab = tab_name
+
+    def _quick_search(self, genre: str):
+        """Quick search for a genre"""
+        self.search_entry.delete(0, 'end')
+        self.search_entry.insert(0, f"{genre} music")
+        self.search_youtube()
+
+    def search_youtube(self):
+        """Search YouTube for videos"""
+        query = self.search_entry.get().strip()
+        if not query:
+            messagebox.showwarning("No Query", "Please enter a search term")
+            return
+
+        # Clear previous results
+        for widget in self.results_scroll.winfo_children():
+            widget.destroy()
+        self.search_results = []
+        self.search_checkboxes = {}
+        self.search_vars = {}
+
+        # Show searching message
+        searching_label = ctk.CTkLabel(
+            self.results_scroll,
+            text=f"🔍 Searching for '{query}'...",
+            font=("Arial", 12),
+            text_color=COLORS["accent"]
+        )
+        searching_label.pack(pady=50)
+
+        # Search in thread
+        thread = threading.Thread(target=self._search_thread, args=(query,))
+        thread.daemon = True
+        thread.start()
+
+    def _search_thread(self, query: str):
+        """Perform YouTube search in background thread"""
+        try:
+            # Use yt-dlp to search YouTube
+            cmd = [
+                "yt-dlp",
+                f"ytsearch20:{query}",  # Search for 20 results
+                "--flat-playlist",
+                "--print", "%(id)s|%(title)s|%(duration_string)s|%(channel)s|%(view_count)s",
+                "--no-warnings"
+            ]
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            results = []
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split("|")
+                if len(parts) >= 4:
+                    video_id = parts[0]
+                    title = parts[1]
+                    duration = parts[2] if len(parts) > 2 else "N/A"
+                    channel = parts[3] if len(parts) > 3 else "Unknown"
+                    views = parts[4] if len(parts) > 4 else "0"
+
+                    # Format views
+                    try:
+                        view_count = int(views) if views and views != "NA" else 0
+                        if view_count >= 1000000:
+                            views_str = f"{view_count / 1000000:.1f}M"
+                        elif view_count >= 1000:
+                            views_str = f"{view_count / 1000:.1f}K"
+                        else:
+                            views_str = str(view_count)
+                    except:
+                        views_str = "N/A"
+
+                    results.append({
+                        "id": video_id,
+                        "url": f"https://www.youtube.com/watch?v={video_id}",
+                        "title": title,
+                        "duration": duration,
+                        "channel": channel,
+                        "views": views_str
+                    })
+
+            process.wait()
+
+            # Update UI on main thread
+            self.after(0, lambda: self._display_search_results(results, query))
+
+        except Exception as e:
+            self.after(0, lambda: self._search_error(str(e)))
+
+    def _display_search_results(self, results: List[Dict], query: str):
+        """Display search results in the UI"""
+        # Clear loading message
+        for widget in self.results_scroll.winfo_children():
+            widget.destroy()
+
+        if not results:
+            no_results = ctk.CTkLabel(
+                self.results_scroll,
+                text=f"No results found for '{query}'",
+                font=("Arial", 12),
+                text_color=COLORS["text"]
+            )
+            no_results.pack(pady=50)
+            return
+
+        self.search_results = results
+        self.results_label.configure(text=f"📋 Found {len(results)} results for '{query}':")
+
+        # Create result items
+        for i, result in enumerate(results):
+            self._create_result_item(i, result)
+
+        self._update_download_button()
+
+    def _create_result_item(self, index: int, result: Dict):
+        """Create a single result item with checkbox and thumbnail"""
+        item_frame = ctk.CTkFrame(self.results_scroll, fg_color=COLORS["card_bg"], corner_radius=5)
+        item_frame.pack(fill="x", pady=3, padx=5)
+
+        # Checkbox
+        var = ctk.BooleanVar(value=False)
+        self.search_vars[result["id"]] = var
+
+        checkbox = ctk.CTkCheckBox(
+            item_frame,
+            text="",
+            variable=var,
+            width=20,
+            command=self._update_download_button
+        )
+        checkbox.pack(side="left", padx=(10, 5), pady=10)
+        self.search_checkboxes[result["id"]] = checkbox
+
+        # Thumbnail frame (placeholder initially)
+        thumb_frame = ctk.CTkFrame(item_frame, fg_color=COLORS["progress_bg"], width=120, height=68)
+        thumb_frame.pack(side="left", padx=5, pady=5)
+        thumb_frame.pack_propagate(False)
+
+        # Placeholder label while loading
+        thumb_label = ctk.CTkLabel(
+            thumb_frame,
+            text="Loading...",
+            font=("Arial", 9),
+            text_color=COLORS["text"]
+        )
+        thumb_label.pack(expand=True)
+
+        # Load thumbnail in background
+        if PIL_AVAILABLE:
+            thread = threading.Thread(
+                target=self._load_thumbnail,
+                args=(result["id"], thumb_label, thumb_frame)
+            )
+            thread.daemon = True
+            thread.start()
+
+        # Info frame
+        info_frame = ctk.CTkFrame(item_frame, fg_color="transparent")
+        info_frame.pack(side="left", fill="both", expand=True, pady=5, padx=5)
+
+        # Title (truncate if too long)
+        title = result["title"]
+        if len(title) > 55:
+            title = title[:52] + "..."
+
+        title_label = ctk.CTkLabel(
+            info_frame,
+            text=f"{index + 1}. {title}",
+            font=("Arial", 12, "bold"),
+            text_color=COLORS["text"],
+            anchor="w"
+        )
+        title_label.pack(anchor="w")
+
+        # Details
+        details = f"{result['duration']} | {result['channel']} | {result['views']} views"
+        details_label = ctk.CTkLabel(
+            info_frame,
+            text=details,
+            font=("Arial", 10),
+            text_color=COLORS["accent"],
+            anchor="w"
+        )
+        details_label.pack(anchor="w")
+
+    def _load_thumbnail(self, video_id: str, label: ctk.CTkLabel, frame: ctk.CTkFrame):
+        """Load thumbnail from YouTube in background thread"""
+        try:
+            # Check cache first
+            if video_id in self.thumbnail_cache:
+                ctk_image = self.thumbnail_cache[video_id]
+                self.after(0, lambda: self._display_thumbnail(label, frame, ctk_image))
+                return
+
+            # YouTube thumbnail URL (medium quality - 320x180)
+            thumb_url = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
+
+            # Download thumbnail
+            with urllib.request.urlopen(thumb_url, timeout=5) as response:
+                data = response.read()
+
+            # Create PIL image and resize
+            pil_image = Image.open(BytesIO(data))
+            pil_image = pil_image.resize((120, 68), Image.Resampling.LANCZOS)
+
+            # Create CTkImage (works with both light and dark mode)
+            ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(120, 68))
+
+            # Cache the image
+            self.thumbnail_cache[video_id] = ctk_image
+
+            # Update UI on main thread
+            self.after(0, lambda: self._display_thumbnail(label, frame, ctk_image))
+
+        except Exception as e:
+            # On error, just show "No thumb"
+            self.after(0, lambda: label.configure(text="No thumb"))
+
+    def _display_thumbnail(self, label: ctk.CTkLabel, frame: ctk.CTkFrame, ctk_image):
+        """Display thumbnail image in the label"""
+        try:
+            label.configure(image=ctk_image, text="")
+        except:
+            pass  # Widget may have been destroyed
+
+    def _search_error(self, error: str):
+        """Handle search error"""
+        for widget in self.results_scroll.winfo_children():
+            widget.destroy()
+
+        error_label = ctk.CTkLabel(
+            self.results_scroll,
+            text=f"Error: {error}",
+            font=("Arial", 12),
+            text_color=COLORS["error"]
+        )
+        error_label.pack(pady=50)
+
+    def _select_all_results(self):
+        """Select all search results"""
+        for var in self.search_vars.values():
+            var.set(True)
+        self._update_download_button()
+
+    def _select_none_results(self):
+        """Deselect all search results"""
+        for var in self.search_vars.values():
+            var.set(False)
+        self._update_download_button()
+
+    def _update_download_button(self):
+        """Update the download button text and state"""
+        selected_count = sum(1 for var in self.search_vars.values() if var.get())
+        self.download_selected_btn.configure(text=f"⬇️ Download Selected ({selected_count})")
+
+        if selected_count > 0:
+            self.download_selected_btn.configure(state="normal")
+        else:
+            self.download_selected_btn.configure(state="disabled")
+
+    def download_selected(self):
+        """Download all selected videos"""
+        selected = [r for r in self.search_results if self.search_vars.get(r["id"], ctk.BooleanVar()).get()]
+
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select at least one video to download")
+            return
+
+        # Check YouTube login first
+        if not self._ensure_youtube_login():
+            return
+
+        # Confirm download
+        response = messagebox.askyesno(
+            "Download Videos",
+            f"Download {len(selected)} selected video(s)?\n\n"
+            f"Files will be saved to:\n{DOWNLOAD_FOLDER}"
+        )
+        if not response:
+            return
+
+        # Start download in thread
+        thread = threading.Thread(target=self._download_selected_thread, args=(selected,))
+        thread.daemon = True
+        thread.start()
+
+    def _download_selected_thread(self, videos: List[Dict]):
+        """Download selected videos in background"""
+        total = len(videos)
+        successful = 0
+        failed = 0
+
+        # Clear progress and start fresh
+        self._clear_search_progress()
+        self._append_search_progress(f"Starting download of {total} video(s)...\n")
+        self._append_search_progress(f"Save folder: {DOWNLOAD_FOLDER}\n\n")
+
+        for i, video in enumerate(videos, 1):
+            title_short = video['title'][:60] + "..." if len(video['title']) > 60 else video['title']
+            self._append_search_progress(f"[{i}/{total}] {title_short}\n")
+            self._append_search_progress(f"    URL: {video['url']}\n")
+
+            try:
+                cmd = [
+                    "yt-dlp",
+                    "-o", f"{DOWNLOAD_FOLDER}/%(title)s.%(ext)s",
+                    "--no-playlist",
+                    "--merge-output-format", self.settings.get("output_format", "mp4"),
+                    "--newline",  # Better progress output
+                    # YouTube bot detection bypass settings
+                    "--js-runtimes", "node",
+                    "--remote-components", "ejs:github",
+                    "--extractor-args", "youtube:player-client=mweb",
+                ]
+                cmd.extend(self._get_cookie_args())
+                cmd.append(video["url"])
+
+                # Add quality options
+                if self.settings.get("audio_only"):
+                    cmd.extend(["-f", "bestaudio", "-x", "--audio-format", "mp3"])
+                else:
+                    quality = self.settings.get("video_quality", "best")
+                    if quality == "best":
+                        cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                        cmd.extend(["-S", "res,vcodec:h264"])
+                    else:
+                        cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+
+                # Stream output line by line
+                last_progress = ""
+                for line in process.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Show download progress or important messages
+                    if "[download]" in line and "%" in line:
+                        # Update progress in place
+                        if "100%" in line or last_progress == "":
+                            self._append_search_progress(f"    {line}\n")
+                            last_progress = line
+                    elif "[Merger]" in line or "Destination:" in line:
+                        self._append_search_progress(f"    {line}\n")
+                    elif "ERROR" in line or "error" in line.lower():
+                        self._append_search_progress(f"    ERROR: {line}\n")
+                    elif "has already been downloaded" in line:
+                        self._append_search_progress(f"    Already exists, skipping\n")
+
+                process.wait()
+
+                if process.returncode == 0:
+                    self._append_search_progress(f"    ✓ SUCCESS\n\n")
+                    successful += 1
+                    self.after(0, lambda v=video: self.add_to_history(v["title"], v["url"], f"{v['title']}.mp4"))
+                else:
+                    self._append_search_progress(f"    ✗ FAILED (exit code {process.returncode})\n\n")
+                    failed += 1
+
+            except Exception as e:
+                self._append_search_progress(f"    ✗ ERROR: {e}\n\n")
+                failed += 1
+
+        self._append_search_progress(f"{'='*50}\n")
+        self._append_search_progress(f"COMPLETE: {successful} successful, {failed} failed\n")
+        self._append_search_progress(f"Files saved to: {DOWNLOAD_FOLDER}")
+
+    def _log_search_progress(self, message: str):
+        """Log message to search progress display (replaces content)"""
+        def update():
+            self.search_progress.configure(state="normal")
+            self.search_progress.delete("1.0", "end")
+            self.search_progress.insert("end", message)
+            self.search_progress.configure(state="disabled")
+        self.after(0, update)
+
+    def _clear_search_progress(self):
+        """Clear search progress display"""
+        def update():
+            self.search_progress.configure(state="normal")
+            self.search_progress.delete("1.0", "end")
+            self.search_progress.configure(state="disabled")
+        self.after(0, update)
+
+    def _append_search_progress(self, message: str):
+        """Append message to search progress display"""
+        def update():
+            self.search_progress.configure(state="normal")
+            self.search_progress.insert("end", message)
+            self.search_progress.see("end")  # Auto-scroll to bottom
+            self.search_progress.configure(state="disabled")
+        self.after(0, update)
 
     def paste_url(self):
         """Paste URL from clipboard"""
@@ -361,6 +1262,10 @@ class QuickTubeApp(ctk.CTk):
             messagebox.showerror("Invalid URL", "Please enter a valid YouTube URL")
             return
 
+        # Check YouTube login first
+        if not self._ensure_youtube_login():
+            return
+
         # Start download in thread
         thread = threading.Thread(target=self._download_video_thread, args=(url,))
         thread.daemon = True
@@ -371,6 +1276,10 @@ class QuickTubeApp(ctk.CTk):
         url = self.url_entry.get().strip()
         if not url:
             messagebox.showwarning("No URL", "Please paste a YouTube channel URL first")
+            return
+
+        # Check YouTube login first
+        if not self._ensure_youtube_login():
             return
 
         # Confirm channel download
@@ -417,8 +1326,13 @@ class QuickTubeApp(ctk.CTk):
                 "--no-colors",
                 "--console-title", "",
                 "--merge-output-format", self.settings.get("output_format", "mp4"),  # Force mp4 output
-                url
+                # YouTube bot detection bypass settings
+                "--js-runtimes", "node",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player-client=mweb",
             ]
+            cmd.extend(self._get_cookie_args())
+            cmd.append(url)
 
             # Add quality options
             if self.settings.get("audio_only"):
@@ -596,8 +1510,13 @@ class QuickTubeApp(ctk.CTk):
                 "--console-title", "",
                 "--yes-playlist",
                 "--merge-output-format", self.settings.get("output_format", "mp4"),  # Force mp4 output
-                url
+                # YouTube bot detection bypass settings
+                "--js-runtimes", "node",
+                "--remote-components", "ejs:github",
+                "--extractor-args", "youtube:player-client=mweb",
             ]
+            cmd.extend(self._get_cookie_args())
+            cmd.append(url)
 
             # Add quality options
             if self.settings.get("audio_only"):

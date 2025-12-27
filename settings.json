@@ -1,5 +1,11 @@
 {
   "video_quality": "best",
   "audio_only": false,
-  "download_folder": "D:\\stacher_downloads"
+  "download_folder": "D:\\stacher_downloads",
+  "output_format": "mp4",
+  "check_compatibility": true,
+  "auto_convert": false,
+  "prefer_h264": true,
+  "browser": "firefox",
+  "cookies_file": "D:\\QuickTube\\temp\\youtube_cookies.txt"
 }

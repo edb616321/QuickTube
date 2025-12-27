@@ -204,7 +204,40 @@ Add QuickTube to your Command Center LaunchPad:
 
 - **Ctrl+V** - Paste URL from clipboard
 
+## YouTube Authentication
+
+YouTube requires authentication to bypass bot detection. QuickTube handles this automatically.
+
+### How It Works
+
+1. Stay logged into YouTube in **Firefox** (your normal browser)
+2. QuickTube automatically reads Firefox cookies on startup
+3. Downloads work without any manual steps
+
+### Requirements
+
+- Firefox browser installed
+- Logged into YouTube in Firefox
+
+### That's It
+
+No Playwright. No manual cookie export. No complex setup. Just stay logged into YouTube in Firefox and QuickTube handles the rest.
+
+### Manual Cookie Refresh (if needed)
+
+If cookies expire, just run:
+```powershell
+cd D:\QuickTube
+python export_firefox_cookies.py
+```
+
 ## Troubleshooting
+
+### "Sign in to confirm you're not a bot" Error
+1. Open Firefox
+2. Go to youtube.com
+3. Make sure you're logged in (you should see your profile icon)
+4. Restart QuickTube
 
 ### "Invalid URL" Error
 - Make sure you copied the full YouTube URL
