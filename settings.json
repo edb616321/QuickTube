@@ -6,6 +6,5 @@
   "check_compatibility": true,
   "auto_convert": false,
   "prefer_h264": true,
-  "browser": "firefox",
-  "cookies_file": "D:\\QuickTube\\temp\\youtube_cookies.txt"
+  "browser": "firefox"
 }

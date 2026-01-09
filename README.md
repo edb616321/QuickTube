@@ -6,21 +6,40 @@ QuickTube is a simple, clean YouTube downloader with a GUI interface. Just paste
 
 ## Features
 
-✅ **Simple Interface** - Paste URL, click download, done
-✅ **Single Video or Channel** - Download one video or entire channels
-✅ **Real-time Progress** - Watch downloads happen live
-✅ **Download History** - Track what you've downloaded
-✅ **Quality Settings** - Choose video quality (best, 1080p, 720p, 480p)
-✅ **Audio Only Option** - Download as MP3
-✅ **Clean UI** - Matches CCL launcher theme
+### Core Features
+- **Simple Interface** - Paste URL, click download, done
+- **Single Video or Channel** - Download one video or entire channels
+- **Real-time Progress** - Watch downloads happen live
+- **Download History** - Track what you've downloaded
+- **Quality Settings** - Choose video quality (best, 1080p, 720p, 480p)
+- **Audio Only Option** - Download as MP3
+- **Clean UI** - Matches CCL launcher theme
+
+### Search Tab (New in 2026-01)
+- **YouTube Search** - Search videos without leaving the app
+- **Video Preview Panel** - See thumbnail, title, duration before downloading
+- **30-Second Preview Clips** - Preview videos with embedded VLC player
+- **Quick Links** - Open video/channel in browser directly
+- **Batch Selection** - Select multiple videos to download at once
+- **Open Folder Button** - Quick access to downloads folder in tab bar
+
+### Codec Compatibility (Added 2025-12)
+- **Automatic Codec Detection** - Scans downloads using FFprobe
+- **Compatibility Warnings** - Alerts for problematic files (Opus audio, VP9/AV1 video)
+- **One-Click Conversion** - Convert incompatible files to H.264 + AAC
+- **Mobile/PLEX Friendly** - Ensures videos work on all devices
 
 ## Installation
 
 ### Required
 
 ```bash
-pip install yt-dlp customtkinter pyperclip
+pip install yt-dlp customtkinter pyperclip pillow requests python-vlc
 ```
+
+### External Requirements
+- **FFmpeg** - For codec detection and conversion
+- **VLC Media Player** - For embedded video preview playback
 
 ### Download Folder
 
@@ -35,22 +54,32 @@ cd D:\QuickTube
 python quicktube.py
 ```
 
-### Download Single Video
+### Download Tab - Single Video
 
 1. Copy YouTube video URL
-2. Click **📋 Paste URL** (or Ctrl+V)
-3. Click **🎬 Download Video**
+2. Click **Paste URL** (or Ctrl+V)
+3. Click **Download Video**
 4. Watch progress in real-time
 5. Done! File is in `D:\stacher_downloads`
 
-### Download Entire Channel
+### Download Tab - Entire Channel
 
 1. Copy YouTube channel URL
-2. Click **📋 Paste URL**
-3. Click **📺 Download Channel**
+2. Click **Paste URL**
+3. Click **Download Channel**
 4. Confirm you want to download all videos
 5. Videos download one by one
 6. All videos save to `D:\stacher_downloads\[Channel Name]\`
+
+### Search Tab
+
+1. Enter search terms in the search box
+2. Click **Search** or press Enter
+3. Browse results with thumbnails on the left
+4. Click **Preview** on any result to see details in the preview panel
+5. Click **Play 30s Preview** to watch a clip embedded in the app
+6. Check boxes to select videos for download
+7. Click **Download Selected** to download all checked videos
 
 ## Supported URLs
 
@@ -61,7 +90,7 @@ python quicktube.py
 
 ## Settings
 
-Click **⚙️ Settings** to configure:
+Click **Settings** to configure:
 
 ### Video Quality
 - **Best** (default) - Highest quality available
@@ -71,6 +100,11 @@ Click **⚙️ Settings** to configure:
 
 ### Audio Only
 - Check this to download MP3 audio only (no video)
+
+### Codec Options
+- **Check Compatibility** - Scan downloads for codec issues (default: on)
+- **Auto Convert** - Automatically convert incompatible files (default: off)
+- **Prefer H.264** - Request H.264 codec from YouTube when available
 
 ## Codec Detection & Compatibility
 
@@ -84,15 +118,6 @@ YouTube sometimes encodes videos with codecs that don't work well on all devices
 - **AV1 video** - Cutting-edge codec with limited device support
 
 Videos may play fine on your computer but fail on phones, tablets, or streaming servers.
-
-### Automatic Detection
-
-After each download, QuickTube checks the video codec:
-```
-[CODEC] Checking: Video Title.mp4
-[CODEC] Video: h264, Audio: opus
-[CODEC] Compatibility: poor - Opus audio not supported on mobile
-```
 
 ### Compatibility Levels
 
@@ -112,63 +137,35 @@ When a compatibility issue is detected, QuickTube offers:
 2. **Skip** - Keep the file as-is (works on computer)
 3. **Auto-Convert** - Enable in settings to always convert problematic files
 
-### Settings
+## Recent Updates
 
-Click **⚙️ Settings** to configure:
+### 2026-01-09 - Embedded Video Preview
+- Added embedded VLC player for preview clips
+- Preview plays inside the app instead of launching external player
+- 30-second clips download via yt-dlp `--download-sections`
 
-- **Check Compatibility** - Scan downloads for codec issues (default: on)
-- **Auto Convert** - Automatically convert incompatible files (default: off)
-- **Prefer H.264** - Request H.264 codec from YouTube when available
+### 2026-01-09 - Search Tab UI Enhancements
+- Added **Open Folder** button to tab bar (always visible)
+- Added **Video/Channel/Preview** link buttons under each search result
+- Added preview panel on right side with thumbnail, title, and action buttons
+- Two-column layout: search results (left) + preview panel (right)
 
-### Batch Conversion
+### 2026-01-09 - Wrong Video Bug Fix
+- Fixed issue where cached videos caused wrong file to be downloaded
+- Added parsing for "has already been downloaded" yt-dlp messages
+- Improved fallback logic to sort temp files by modification time
+- Added auto-cleanup of temp files older than 24 hours
 
-To convert existing files with compatibility issues:
+### 2025-12-20 - Codec Compatibility
+- Added FFprobe-based codec detection
+- Compatibility warnings for Opus audio in MP4
+- Batch conversion tool for problematic files
 
-```python
-from codec_utils import batch_analyze, convert_for_compatibility
-import os
-
-# Analyze a folder
-folder = "D:/stacher_downloads/Channel Name"
-for file in os.listdir(folder):
-    if file.endswith('.mp4'):
-        path = os.path.join(folder, file)
-        info = detect_codecs(path)
-        if not info.is_mobile_compatible:
-            output = path.replace('.mp4', '_converted.mp4')
-            convert_for_compatibility(path, output)
-```
-
-### What Gets Converted
-
-- **Audio only** (default): Opus → AAC (fast, preserves video quality)
-- **Full conversion**: Also converts VP9/AV1 → H.264 (slower, for maximum compatibility)
-
-Converted files are saved alongside originals with `_converted` suffix.
-
-## Download History
-
-Recent downloads appear at the bottom with:
-- ✓ checkmark for completed downloads
-- **📂 Open** button to view the file
-
-## Buttons
-
-- **🎬 Download Video** - Download single video
-- **📺 Download Channel** - Download all videos from channel
-- **📋 Paste URL** - Paste URL from clipboard
-- **📁 Open Downloads Folder** - Open D:\stacher_downloads in Explorer
-- **⚙️ Settings** - Configure quality and audio settings
-- **❌ Close** - Close the application
-
-## Progress Display
-
-The progress display shows:
-- `[START]` - Download beginning
-- `[PROGRESS]` - Download percentage and speed
-- `[SUCCESS]` - Download complete
-- `[DONE]` - All downloads finished
-- `[ERROR]` - If something went wrong
+### 2025-11-05 - Progress Display Fixes
+- Fixed progress tracking with temp folder architecture
+- Thread-safe UI updates
+- Clean output without ANSI codes
+- Duplicate file handling dialog
 
 ## File Organization
 
@@ -187,6 +184,54 @@ D:\stacher_downloads\
     └── Video 3.mp4
 ```
 
+## Files
+
+```
+D:\QuickTube\
+├── quicktube.py           # Main application
+├── codec_utils.py         # Codec detection utilities
+├── settings.json          # User preferences
+├── download_history.json  # Download history
+├── temp/                  # Temporary download folder
+├── logs/                  # Application logs
+├── README.md              # This file
+└── FIXES.md               # Bug fix documentation
+```
+
+## Troubleshooting
+
+### Preview Not Playing in App
+- Ensure VLC Media Player is installed
+- Check that python-vlc package is installed: `pip install python-vlc`
+- Check logs in `D:\QuickTube\logs\` for errors
+- Falls back to external player if embedded fails
+
+### Wrong Video Downloaded
+- This was fixed in 2026-01-09 update
+- Temp folder is now auto-cleaned every 24 hours
+- If issue persists, manually clear `D:\QuickTube\temp\`
+
+### "Sign in to confirm you're not a bot" Error
+1. Open Firefox
+2. Go to youtube.com
+3. Make sure you're logged in (you should see your profile icon)
+4. Restart QuickTube
+
+### Open Folder Not Working
+- Ensure download folder exists
+- App will create folder if missing
+- Falls back to subprocess if os.startfile fails
+
+### Download Fails
+- Check your internet connection
+- Video might be private or age-restricted
+- Try updating yt-dlp: `pip install --upgrade yt-dlp`
+
+### Codec Compatibility Issues
+- Files with Opus audio may not play on mobile/PLEX
+- Use the conversion feature to convert to AAC audio
+- Check `D:\stacher_downloads\*_Converted\` for converted files
+
 ## Integration with CCL
 
 Add QuickTube to your Command Center LaunchPad:
@@ -203,6 +248,7 @@ Add QuickTube to your Command Center LaunchPad:
 ## Keyboard Shortcuts
 
 - **Ctrl+V** - Paste URL from clipboard
+- **Enter** - Submit search (in search tab)
 
 ## YouTube Authentication
 
@@ -219,45 +265,6 @@ YouTube requires authentication to bypass bot detection. QuickTube handles this 
 - Firefox browser installed
 - Logged into YouTube in Firefox
 
-### That's It
-
-No Playwright. No manual cookie export. No complex setup. Just stay logged into YouTube in Firefox and QuickTube handles the rest.
-
-### Manual Cookie Refresh (if needed)
-
-If cookies expire, just run:
-```powershell
-cd D:\QuickTube
-python export_firefox_cookies.py
-```
-
-## Troubleshooting
-
-### "Sign in to confirm you're not a bot" Error
-1. Open Firefox
-2. Go to youtube.com
-3. Make sure you're logged in (you should see your profile icon)
-4. Restart QuickTube
-
-### "Invalid URL" Error
-- Make sure you copied the full YouTube URL
-- URL must contain `youtube.com` or `youtu.be`
-
-### Download Fails
-- Check your internet connection
-- Video might be private or age-restricted
-- Try updating yt-dlp: `pip install --upgrade yt-dlp`
-
-### Slow Downloads
-- This is normal for large files
-- Check the progress display for speed
-- Quality setting affects file size (lower quality = faster)
-
-### Channel Download Takes Forever
-- Channels with many videos take time
-- Each video downloads sequentially
-- You can close QuickTube and downloads will stop (don't close mid-download)
-
 ## Advanced: Command Line
 
 QuickTube uses `yt-dlp` behind the scenes. You can also use it directly:
@@ -273,30 +280,10 @@ yt-dlp -o "D:\stacher_downloads\%(uploader)s\%(title)s.%(ext)s" --yes-playlist [
 yt-dlp -f bestaudio -x -o "D:\stacher_downloads\%(title)s.%(ext)s" [URL]
 ```
 
-## Files
-
-- `quicktube.py` - Main application
-- `codec_utils.py` - Codec detection and conversion utilities
-- `settings.json` - User settings
-- `download_history.json` - Download history
-- `README.md` - This file
-
-## Requirements
-
-### Core Dependencies
-```powershell
-pip install yt-dlp customtkinter pyperclip
-```
-
-### For Codec Detection & Conversion
-- **FFmpeg** - Required for codec detection and conversion
-  - Download: https://ffmpeg.org/download.html
-  - Add `ffmpeg.exe` and `ffprobe.exe` to system PATH
-
 ## Support
 
 For issues with:
-- **QuickTube UI**: Check this README
+- **QuickTube UI**: Check this README and FIXES.md
 - **yt-dlp downloads**: Visit https://github.com/yt-dlp/yt-dlp
 
 ---

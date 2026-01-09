@@ -1,5 +1,76 @@
 # QuickTube Progress Display Fixes
 
+## 2026-01-09 Updates
+
+### Embedded VLC Video Preview
+
+**Problem:** When clicking "Play 30s Preview", the video opened in an external VLC window instead of playing inside the app.
+
+**Solution:** Implemented embedded VLC player using python-vlc:
+
+```python
+# Import VLC with fallback
+try:
+    import vlc
+    VLC_AVAILABLE = True
+except ImportError:
+    VLC_AVAILABLE = False
+
+# Create embedded video frame
+self.vlc_video_frame = tk.Frame(self.preview_thumb_frame, bg='black', width=280, height=158)
+handle = self.vlc_video_frame.winfo_id()
+self.vlc_player.set_hwnd(handle)
+
+# Play video embedded
+media = self.vlc_instance.media_new(filepath)
+self.vlc_player.set_media(media)
+self.vlc_player.play()
+```
+
+### Search Tab UI Enhancements
+
+**Added Features:**
+- **Open Folder Button** - Always visible in tab bar for quick access to downloads
+- **Video/Channel Links** - Clickable buttons under each search result
+- **Preview Panel** - Right side panel showing thumbnail, title, and action buttons
+- **Two-Column Layout** - Results on left, preview on right
+
+**Code Changes:**
+- Added `webbrowser` import for opening URLs
+- Added Open Folder button to tab frame
+- Added Video/Channel/Preview link buttons in `_create_result_item()`
+- Created preview panel with 320x380px fixed size
+- Added `_set_preview_video()` and `_play_preview_clip()` methods
+
+### Wrong Video Bug Fix
+
+**Problem:** Pasting one YouTube URL resulted in downloading a completely different video.
+
+**Root Cause:** When yt-dlp found a cached file, it output "has already been downloaded" instead of "[download] Destination:". The code only parsed the Destination line, so the fallback logic kicked in and picked a random .mp4 from the temp folder (which had 70+ cached files).
+
+**Solution:**
+1. Added parsing for "has already been downloaded" lines
+2. Improved fallback to sort by modification time (newest first)
+3. Added auto-cleanup of temp files older than 24 hours
+
+```python
+# Parse cached file line
+if "has already been downloaded" in line:
+    match = re.search(r'\[download\] (.+) has already been downloaded', line)
+    if match:
+        cached_file_path = match.group(1)
+        temp_file_path = cached_file_path
+
+# Auto-cleanup old temp files
+def _cleanup_old_temp_files(self, max_age_hours=24):
+    cutoff_time = time.time() - (max_age_hours * 3600)
+    for f in os.listdir(TEMP_FOLDER):
+        if os.path.getmtime(filepath) < cutoff_time:
+            os.remove(filepath)
+```
+
+---
+
 ## CRITICAL FIX: Temp Folder Architecture (2025-11-05)
 
 **Problem:** Downloading directly to D:\stacher_downloads caused errors when files already existed. yt-dlp would return error code 1, causing confusion and failed downloads.

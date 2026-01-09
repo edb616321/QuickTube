@@ -14,7 +14,9 @@ import socket
 import sqlite3
 import shutil
 import tempfile
-from datetime import datetime
+import logging
+import webbrowser
+from datetime import datetime, timedelta
 from pathlib import Path
 import pyperclip
 from tkinter import messagebox
@@ -30,13 +32,24 @@ except ImportError:
     PIL_AVAILABLE = False
     print("[QuickTube] Warning: PIL not available, thumbnails disabled")
 
-# For automated YouTube login
+# For embedded video playback
 try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
+    import vlc
+    VLC_AVAILABLE = True
 except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    print("[QuickTube] Warning: Playwright not available, manual login required")
+    VLC_AVAILABLE = False
+    print("[QuickTube] Warning: python-vlc not available, preview will use external player")
+
+# For automated YouTube login using undetected-chromedriver
+try:
+    import undetected_chromedriver as uc
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    UC_AVAILABLE = True
+except ImportError:
+    UC_AVAILABLE = False
+    print("[QuickTube] Warning: undetected-chromedriver not available, manual login required")
 
 # Import codec utilities for compatibility checking
 try:
@@ -52,10 +65,48 @@ except ImportError:
 # Constants
 DOWNLOAD_FOLDER = r"D:\stacher_downloads"
 TEMP_FOLDER = r"D:\QuickTube\temp"
+LOG_FOLDER = r"D:\QuickTube\logs"
 SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "download_history.json"
 POT_SERVER_PATH = r"D:\QuickTube\pot-provider\server"
 POT_SERVER_PORT = 4416
+
+# Setup logging system
+def setup_logging():
+    """Setup persistent logging with automatic cleanup of old logs"""
+    os.makedirs(LOG_FOLDER, exist_ok=True)
+
+    # Clean up logs older than 7 days
+    try:
+        cutoff = datetime.now() - timedelta(days=7)
+        for log_file in Path(LOG_FOLDER).glob("quicktube_*.log"):
+            if datetime.fromtimestamp(log_file.stat().st_mtime) < cutoff:
+                log_file.unlink()
+    except Exception as e:
+        print(f"[QuickTube] Warning: Could not clean old logs: {e}")
+
+    # Create log file with today's date
+    log_file = os.path.join(LOG_FOLDER, f"quicktube_{datetime.now().strftime('%Y%m%d')}.log")
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+
+    logger = logging.getLogger('QuickTube')
+    logger.info("=" * 60)
+    logger.info("QuickTube started")
+    logger.info(f"Log file: {log_file}")
+    return logger
+
+# Initialize logger
+logger = setup_logging()
 
 # Colors - Match CCL theme
 COLORS = {
@@ -97,8 +148,8 @@ class QuickTubeApp(ctk.CTk):
         # Ensure temp folder exists
         os.makedirs(TEMP_FOLDER, exist_ok=True)
 
-        # Auto-refresh cookies from Firefox on startup
-        self._refresh_firefox_cookies()
+        # Check for valid cookies and auto-login if needed
+        self._auto_login_if_needed()
 
         # Start POT server if not running (for YouTube bot detection bypass)
         self.pot_server_process = None
@@ -155,18 +206,320 @@ class QuickTubeApp(ctk.CTk):
         except Exception as e:
             print(f"[QuickTube] Warning: Could not start POT server: {e}")
 
-    def _check_youtube_login(self) -> bool:
-        """Check if user is logged into YouTube in Firefox"""
+    def _auto_login_if_needed(self):
+        """Automatically login to YouTube on startup if not authenticated"""
+        logger.info("[AUTO-LOGIN] Checking authentication status...")
+
+        # Check if we have valid auth cookies in the default location
+        cookies_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
+        has_auth = False
+
+        if os.path.exists(cookies_file):
+            try:
+                with open(cookies_file, 'r') as f:
+                    content = f.read()
+                    auth_cookies = ['LOGIN_INFO', 'SID', 'HSID', 'SSID', '__Secure-1PSID', 'SAPISID']
+                    has_auth = any(cookie in content for cookie in auth_cookies)
+                    if has_auth:
+                        logger.info(f"[AUTO-LOGIN] Found auth cookies in {cookies_file}")
+            except:
+                pass
+
+        if has_auth:
+            logger.info("[AUTO-LOGIN] Already authenticated - skipping login")
+            return
+
+        logger.info("[AUTO-LOGIN] Not authenticated - performing automatic login...")
+
+        # Run undetected-chromedriver login automatically (no prompts)
+        if UC_AVAILABLE:
+            try:
+                self._uc_youtube_login()
+            except Exception as e:
+                logger.error(f"[AUTO-LOGIN] Failed: {e}")
+        else:
+            logger.warning("[AUTO-LOGIN] undetected-chromedriver not available - manual login required")
+
+    def _slow_type(self, element, text, delay=0.08):
+        """Type text slowly like a human to avoid bot detection"""
+        import time
+        for char in text:
+            element.send_keys(char)
+            time.sleep(delay)
+
+    def _uc_youtube_login(self):
+        """Perform automatic YouTube login using undetected-chromedriver"""
+        import time
+
+        email = self.settings.get("youtube_email", "joeb00399@gmail.com")
+        password = self.settings.get("youtube_password", "#CLSadmin09")
+
+        logger.info(f"[UC-LOGIN] Starting login for {email}")
+
+        # Create undetected Chrome instance
+        options = uc.ChromeOptions()
+        options.add_argument("--start-maximized")
+
+        # Use a persistent user data directory
+        user_data_dir = os.path.join(os.path.dirname(__file__), "chrome_profile")
+        os.makedirs(user_data_dir, exist_ok=True)
+        options.add_argument(f"--user-data-dir={user_data_dir}")
+
+        driver = uc.Chrome(options=options, version_main=None)
+        wait = WebDriverWait(driver, 20)
+
         try:
-            # Run yt-dlp to check for YouTube auth cookies
+            # Navigate to YouTube
+            logger.info("[UC-LOGIN] Loading YouTube...")
+            driver.get("https://www.youtube.com")
+            time.sleep(5)
+
+            # Check if already logged in
+            page_source = driver.page_source
+            if "Sign in" not in page_source and "avatar" in page_source.lower():
+                logger.info("[UC-LOGIN] Already logged in!")
+                self._export_uc_cookies(driver)
+                return True
+
+            # Navigate to Google sign-in
+            logger.info("[UC-LOGIN] Navigating to Google sign-in...")
+            driver.get("https://accounts.google.com/signin/v2/identifier?service=youtube")
+            time.sleep(5)
+
+            # Wait for email field and enter email slowly
+            logger.info("[UC-LOGIN] Waiting for email field...")
+            email_input = wait.until(EC.presence_of_element_located((By.ID, "identifierId")))
+            time.sleep(2)
+
+            logger.info("[UC-LOGIN] Entering email slowly...")
+            self._slow_type(email_input, email)
+            time.sleep(2)
+
+            # Click Next
+            logger.info("[UC-LOGIN] Clicking Next...")
+            next_button = driver.find_element(By.ID, "identifierNext")
+            next_button.click()
+            time.sleep(5)
+
+            # Check for blocks
+            page_source = driver.page_source
+            if "couldn't sign you in" in page_source.lower():
+                logger.error("[UC-LOGIN] BLOCKED by Google")
+                return False
+
+            # Wait for password field
+            logger.info("[UC-LOGIN] Waiting for password field...")
+            password_input = wait.until(EC.presence_of_element_located((By.NAME, "Passwd")))
+            time.sleep(2)
+
+            # Enter password slowly
+            logger.info("[UC-LOGIN] Entering password slowly...")
+            self._slow_type(password_input, password)
+            time.sleep(2)
+
+            # Click password Next
+            logger.info("[UC-LOGIN] Clicking password Next...")
+            password_next = driver.find_element(By.ID, "passwordNext")
+            password_next.click()
+            time.sleep(8)
+
+            # Check for success
+            current_url = driver.current_url
+            logger.info(f"[UC-LOGIN] Current URL: {current_url}")
+
+            if "youtube.com" in current_url:
+                logger.info("[UC-LOGIN] SUCCESS! Redirected to YouTube!")
+                self._export_uc_cookies(driver)
+                time.sleep(3)
+                return True
+            elif "challenge" in current_url or "signin" in current_url:
+                logger.warning("[UC-LOGIN] 2FA or challenge may be required")
+                time.sleep(30)  # Wait for manual intervention
+                self._export_uc_cookies(driver)
+                return True
+            else:
+                logger.warning(f"[UC-LOGIN] Unknown state: {current_url}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[UC-LOGIN] Error: {e}")
+            return False
+
+        finally:
+            logger.info("[UC-LOGIN] Closing browser...")
+            driver.quit()
+
+    def _export_uc_cookies(self, driver):
+        """Export cookies from undetected-chromedriver session"""
+        cookies = driver.get_cookies()
+        cookie_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
+        os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+        with open(cookie_file, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("# Auto-generated by QuickTube undetected-chromedriver login\n\n")
+            for cookie in cookies:
+                domain = cookie.get('domain', '')
+                flag = "TRUE" if domain.startswith('.') else "FALSE"
+                path = cookie.get('path', '/')
+                secure = "TRUE" if cookie.get('secure', False) else "FALSE"
+                expiry = str(int(cookie.get('expiry', 0)))
+                name = cookie.get('name', '')
+                value = cookie.get('value', '')
+                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n")
+
+        auth_cookies = [c for c in cookies if c['name'] in ['SID', 'SSID', 'HSID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID']]
+        logger.info(f"[UC-LOGIN] Saved {len(cookies)} cookies ({len(auth_cookies)} auth cookies) to {cookie_file}")
+
+        # Update settings to use this cookie file
+        self.settings["cookies_file"] = cookie_file
+        self.save_settings()
+
+    def _playwright_youtube_login_silent(self):
+        """Perform fully automatic YouTube login using Playwright - NO user interaction"""
+        email = self.settings.get("youtube_email", "joeb00399@gmail.com")
+        password = self.settings.get("youtube_password", "#clsADMIN09")
+
+        logger.info(f"[AUTO-LOGIN] Starting silent login for {email}")
+
+        try:
+            with sync_playwright() as p:
+                # Launch browser - headless for speed, but can show if needed
+                logger.info("[AUTO-LOGIN] Launching browser...")
+                browser = p.chromium.launch(headless=False)  # Use Chromium, show window for any CAPTCHA
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                page = context.new_page()
+
+                # Go directly to YouTube to set initial cookies
+                logger.info("[AUTO-LOGIN] Loading YouTube...")
+                page.goto("https://www.youtube.com", wait_until="networkidle")
+                page.wait_for_timeout(2000)
+
+                # Click sign in button
+                try:
+                    sign_in = page.locator('a[href*="accounts.google.com"]').first
+                    if sign_in.is_visible(timeout=5000):
+                        sign_in.click()
+                        page.wait_for_timeout(2000)
+                except:
+                    # Try direct login URL
+                    page.goto("https://accounts.google.com/signin/v2/identifier?service=youtube&hl=en")
+
+                page.wait_for_load_state("networkidle")
+
+                # Enter email
+                logger.info("[AUTO-LOGIN] Entering email...")
+                email_input = page.locator('input[type="email"]')
+                if email_input.is_visible(timeout=10000):
+                    email_input.fill(email)
+                    page.wait_for_timeout(500)
+                    # Click Next button
+                    page.locator('#identifierNext').click()
+                    page.wait_for_timeout(3000)
+
+                # Enter password
+                logger.info("[AUTO-LOGIN] Entering password...")
+                password_input = page.locator('input[type="password"]')
+                if password_input.is_visible(timeout=10000):
+                    password_input.fill(password)
+                    page.wait_for_timeout(500)
+                    # Click Next button
+                    page.locator('#passwordNext').click()
+                    logger.info("[AUTO-LOGIN] Password submitted, waiting for redirect...")
+                    page.wait_for_timeout(5000)
+
+                # Wait for YouTube redirect or handle any prompts
+                try:
+                    # Wait up to 60 seconds for redirect to YouTube
+                    page.wait_for_url("**youtube.com**", timeout=60000)
+                    logger.info("[AUTO-LOGIN] Successfully redirected to YouTube!")
+                except:
+                    logger.warning("[AUTO-LOGIN] Timeout - may need manual intervention for 2FA/CAPTCHA")
+
+                # Navigate to YouTube to ensure all cookies are set
+                page.goto("https://www.youtube.com")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(3000)
+
+                # Save all cookies
+                cookies = context.cookies()
+                self._save_cookies_to_file(cookies)
+
+                # Count auth cookies saved
+                auth_count = len([c for c in cookies if c.get('name') in ['LOGIN_INFO', 'SID', 'HSID', 'SSID', '__Secure-1PSID', 'SAPISID']])
+                logger.info(f"[AUTO-LOGIN] Saved {len(cookies)} cookies ({auth_count} auth cookies)")
+
+                browser.close()
+                logger.info("[AUTO-LOGIN] Login complete!")
+
+        except Exception as e:
+            logger.error(f"[AUTO-LOGIN] Error: {e}")
+            raise
+
+    def _save_cookies_to_file(self, cookies):
+        """Save cookies to Netscape format file for yt-dlp"""
+        cookies_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
+        os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+        with open(cookies_file, 'w') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("# Auto-generated by QuickTube\n\n")
+            for cookie in cookies:
+                domain = cookie.get('domain', '')
+                if not domain.startswith('.') and not domain.startswith('www'):
+                    domain = '.' + domain
+                flag = "TRUE" if domain.startswith('.') else "FALSE"
+                path = cookie.get('path', '/')
+                secure = "TRUE" if cookie.get('secure', False) else "FALSE"
+                expires = str(int(cookie.get('expires', 0))) if cookie.get('expires') else "0"
+                name = cookie.get('name', '')
+                value = cookie.get('value', '')
+                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+        self.settings["cookies_file"] = cookies_file
+        self.save_settings()
+        logger.info(f"[AUTO-LOGIN] Cookies saved to {cookies_file}")
+
+    def _check_youtube_login(self) -> bool:
+        """Check if we have valid YouTube authentication cookies"""
+        # First check our saved cookies file for authentication cookies
+        cookies_file = self.settings.get("cookies_file")
+        if cookies_file and os.path.exists(cookies_file):
+            try:
+                with open(cookies_file, 'r') as f:
+                    content = f.read()
+                    # Check for key authentication cookies
+                    auth_cookies = ['LOGIN_INFO', 'SID', 'HSID', 'SSID', '__Secure-1PSID', 'SAPISID']
+                    has_auth = any(cookie in content for cookie in auth_cookies)
+                    if has_auth:
+                        logger.info("[AUTH] Found authentication cookies in cookies file")
+                        return True
+                    else:
+                        logger.warning("[AUTH] Cookies file exists but no auth cookies found")
+            except Exception as e:
+                logger.warning(f"[AUTH] Error reading cookies file: {e}")
+
+        # Fallback: try yt-dlp with browser cookies
+        try:
+            logger.info("[AUTH] Checking YouTube login via yt-dlp...")
             result = subprocess.run(
                 ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json",
                  "--skip-download", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
                 capture_output=True, text=True, timeout=30
             )
-            # If it succeeds without bot detection error, we're logged in
-            return result.returncode == 0 and "Sign in to confirm" not in result.stderr
-        except:
+            # Check for bot detection errors
+            if "Sign in to confirm" in result.stderr or "bot" in result.stderr.lower():
+                logger.warning("[AUTH] YouTube detected as bot - login required")
+                return False
+            if result.returncode == 0:
+                logger.info("[AUTH] yt-dlp auth check passed")
+                return True
+            logger.warning(f"[AUTH] yt-dlp returned code {result.returncode}")
+            return False
+        except Exception as e:
+            logger.warning(f"[AUTH] Auth check failed: {e}")
             return False
 
     def _prompt_youtube_login(self):
@@ -196,58 +549,77 @@ class QuickTubeApp(ctk.CTk):
             messagebox.showerror("Login Error", f"Failed to open browser: {e}")
 
     def _playwright_youtube_login(self):
-        """Perform YouTube login using Playwright"""
-        # Firefox profile path for persistent cookies
-        firefox_profile = os.path.join(os.path.expanduser("~"),
-            "AppData", "Roaming", "Mozilla", "Firefox", "Profiles")
+        """Perform YouTube login using Playwright with stored credentials"""
+        # Get credentials from settings
+        email = self.settings.get("youtube_email", "joeb00399@gmail.com")
+        password = self.settings.get("youtube_password", "#clsADMIN09")
 
-        # Find the default profile
-        profile_dir = None
-        if os.path.exists(firefox_profile):
-            for folder in os.listdir(firefox_profile):
-                if folder.endswith(".default-release") or folder.endswith(".default"):
-                    profile_dir = os.path.join(firefox_profile, folder)
-                    break
+        logger.info(f"[LOGIN] Starting YouTube login for {email}")
 
         try:
             with sync_playwright() as p:
-                # Launch Firefox with persistent context to save cookies
+                # Launch Firefox (visible so user can handle 2FA/CAPTCHA if needed)
+                logger.info("[LOGIN] Launching Firefox browser...")
                 browser = p.firefox.launch(headless=False)
                 context = browser.new_context()
                 page = context.new_page()
 
                 # Navigate to YouTube login
-                page.goto("https://accounts.google.com/signin/v2/identifier?service=youtube")
+                logger.info("[LOGIN] Navigating to Google sign-in...")
+                page.goto("https://accounts.google.com/signin/v2/identifier?service=youtube&hl=en")
                 page.wait_for_load_state("networkidle")
 
                 # Fill in email
+                logger.info("[LOGIN] Entering email...")
                 email_input = page.locator('input[type="email"]')
                 if email_input.is_visible():
-                    email_input.fill("joeb00399@gmail.com")
+                    email_input.fill(email)
                     page.click('button:has-text("Next")')
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(3000)  # Wait for password page to load
 
                 # Wait for password field
+                logger.info("[LOGIN] Entering password...")
                 password_input = page.locator('input[type="password"]')
-                if password_input.is_visible(timeout=10000):
-                    password_input.fill("#CLSadmin09")
+                if password_input.is_visible(timeout=15000):
+                    password_input.fill(password)
+                    page.wait_for_timeout(500)
                     page.click('button:has-text("Next")')
+                    logger.info("[LOGIN] Password submitted, waiting for authentication...")
+                else:
+                    logger.warning("[LOGIN] Password field not found - may need manual intervention")
 
                 # Wait for login to complete or user to handle 2FA
-                # Check for YouTube homepage or profile icon
+                # Check for YouTube homepage or redirect
                 try:
-                    page.wait_for_url("*youtube.com*", timeout=120000)  # 2 min for 2FA
-                    page.wait_for_timeout(3000)  # Extra time to ensure cookies are set
-                except:
-                    pass  # User may have closed browser
+                    # Wait up to 3 minutes for 2FA/CAPTCHA completion
+                    page.wait_for_url("**youtube.com**", timeout=180000)
+                    logger.info("[LOGIN] Redirected to YouTube - login successful!")
 
-                # Export cookies to Firefox profile format
+                    # Navigate to YouTube to get all cookies
+                    page.goto("https://www.youtube.com")
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(3000)  # Extra time to ensure cookies are set
+
+                except Exception as e:
+                    logger.warning(f"[LOGIN] Timeout waiting for YouTube redirect: {e}")
+                    # Try to continue anyway - user may have completed login manually
+
+                # Export cookies
                 cookies = context.cookies()
-                self._save_cookies_to_firefox(cookies)
+                youtube_cookies = [c for c in cookies if 'youtube' in c.get('domain', '') or 'google' in c.get('domain', '')]
+                logger.info(f"[LOGIN] Captured {len(youtube_cookies)} YouTube/Google cookies")
+
+                if youtube_cookies:
+                    self._save_cookies_to_firefox(cookies)
+                    logger.info("[LOGIN] Cookies saved successfully!")
+                else:
+                    logger.warning("[LOGIN] No YouTube cookies captured - login may have failed")
 
                 browser.close()
+                logger.info("[LOGIN] Browser closed")
 
         except Exception as e:
+            logger.error(f"[LOGIN] Playwright login error: {e}")
             print(f"[QuickTube] Playwright login error: {e}")
 
     def _save_cookies_to_firefox(self, cookies):
@@ -305,6 +677,27 @@ class QuickTubeApp(ctk.CTk):
                 return path
         return None
 
+    def _find_node_path(self) -> str:
+        """Find Node.js executable path for yt-dlp JavaScript runtime"""
+        possible_paths = [
+            r"D:\Program Files\nodejs\node.exe",
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files (x86)\nodejs\node.exe",
+            os.path.expandvars(r"%APPDATA%\nvm\current\node.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\node\node.exe"),
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        # Try to find via where command
+        try:
+            result = subprocess.run(["where", "node"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().split('\n')[0]
+        except:
+            pass
+        return None
+
     def _ensure_youtube_login(self) -> bool:
         """Ensure user is logged into YouTube, prompt if not"""
         if self._check_youtube_login():
@@ -316,6 +709,47 @@ class QuickTubeApp(ctk.CTk):
         import time
         time.sleep(2)
         return self._check_youtube_login()
+
+    def _force_youtube_login(self):
+        """Force a new YouTube login (button handler)"""
+        logger.info("[LOGIN] User requested YouTube login...")
+        self.login_status.configure(text="Logging in...", text_color=COLORS["accent"])
+        self.update()
+
+        # Delete existing cookies to force fresh login
+        cookies_file = self.settings.get("cookies_file")
+        if cookies_file and os.path.exists(cookies_file):
+            try:
+                os.remove(cookies_file)
+                logger.info("[LOGIN] Removed old cookies file")
+            except Exception as e:
+                logger.warning(f"[LOGIN] Could not remove old cookies: {e}")
+
+        # Trigger login
+        self._prompt_youtube_login()
+
+        # Update status after login attempt
+        self.after(5000, self._update_login_status)
+
+    def _update_login_status(self):
+        """Update the login status indicator"""
+        def check_async():
+            is_logged_in = self._check_youtube_login()
+            # Schedule UI update on main thread
+            self.after(0, lambda: self._set_login_status(is_logged_in))
+
+        # Run check in background thread
+        thread = threading.Thread(target=check_async, daemon=True)
+        thread.start()
+
+    def _set_login_status(self, is_logged_in: bool):
+        """Set the login status label (called from main thread)"""
+        if is_logged_in:
+            self.login_status.configure(text="✓ Logged in", text_color="#00FF00")
+            logger.info("[AUTH] Login status: Authenticated")
+        else:
+            self.login_status.configure(text="✗ Not logged in", text_color="#FF6666")
+            logger.warning("[AUTH] Login status: Not authenticated")
 
     def _refresh_firefox_cookies(self):
         """Auto-refresh cookies from Firefox on startup"""
@@ -369,11 +803,21 @@ class QuickTubeApp(ctk.CTk):
             print(f"[QuickTube] Cookie refresh failed: {e}")
 
     def _get_cookie_args(self) -> list:
-        """Get the appropriate cookie arguments for yt-dlp"""
-        cookies_file = self.settings.get("cookies_file")
-        if cookies_file and os.path.exists(cookies_file):
+        """Get the appropriate cookie arguments for yt-dlp
+
+        Uses --cookies with a cookie file exported by undetected-chromedriver login.
+        This bypasses browser cookie encryption issues on Windows.
+        """
+        cookies_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
+
+        if os.path.exists(cookies_file):
+            logger.info(f"[COOKIES] Using --cookies {cookies_file}")
             return ["--cookies", cookies_file]
-        return ["--cookies-from-browser", "firefox"]
+        else:
+            # Fallback to browser cookies if no file exists
+            browser = self.settings.get("browser", "firefox")
+            logger.info(f"[COOKIES] Cookie file not found, using --cookies-from-browser {browser}")
+            return ["--cookies-from-browser", browser]
 
     def load_settings(self):
         """Load settings from JSON file"""
@@ -385,7 +829,7 @@ class QuickTubeApp(ctk.CTk):
             "check_compatibility": True,  # Check codecs after download
             "auto_convert": False,  # Auto-convert incompatible files
             "prefer_h264": True,  # Prefer H.264 codec when downloading
-            "browser": "firefox",  # Browser for cookies: firefox recommended (chrome/edge have DPAPI issues)
+            "browser": "chrome",  # Browser for cookies: chrome, firefox, edge, brave, etc.
         }
 
         if os.path.exists(SETTINGS_FILE):
@@ -452,6 +896,16 @@ class QuickTubeApp(ctk.CTk):
         )
         folder_label.pack(side="left", padx=10, pady=10)
 
+        # Browser indicator (shows which browser is used for cookies)
+        browser = self.settings.get("browser", "chrome")
+        browser_label = ctk.CTkLabel(
+            header,
+            text=f"🌐 {browser.title()}",
+            font=("Arial", 12),
+            text_color=COLORS["accent"]
+        )
+        browser_label.pack(side="right", padx=10, pady=10)
+
         # Tab buttons
         tab_frame = ctk.CTkFrame(self, fg_color="transparent")
         tab_frame.pack(fill="x", padx=20, pady=(5, 0))
@@ -479,6 +933,19 @@ class QuickTubeApp(ctk.CTk):
             height=40
         )
         self.search_tab_btn.pack(side="left", padx=5)
+
+        # Open Folder button (always visible)
+        open_folder_btn = ctk.CTkButton(
+            tab_frame,
+            text="📁 Open Folder",
+            command=self.open_download_folder,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 14, "bold"),
+            width=140,
+            height=40
+        )
+        open_folder_btn.pack(side="left", padx=5)
 
         # Container for tab content
         self.tab_container = ctk.CTkFrame(self, fg_color="transparent")
@@ -697,9 +1164,13 @@ class QuickTubeApp(ctk.CTk):
             )
             btn.pack(side="left", padx=2)
 
-        # Results section (don't expand - leave room for progress)
-        results_frame = ctk.CTkFrame(self.search_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
-        results_frame.pack(fill="x", pady=10)
+        # Results section with two columns (results + preview)
+        results_container = ctk.CTkFrame(self.search_tab_frame, fg_color="transparent")
+        results_container.pack(fill="x", pady=10)
+
+        # Left column: Results list
+        results_frame = ctk.CTkFrame(results_container, fg_color=COLORS["card_bg"], corner_radius=10)
+        results_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
         results_header = ctk.CTkFrame(results_frame, fg_color="transparent")
         results_header.pack(fill="x", padx=15, pady=(10, 5))
@@ -746,7 +1217,7 @@ class QuickTubeApp(ctk.CTk):
             fg_color=COLORS["progress_bg"],
             height=280
         )
-        self.results_scroll.pack(fill="x", padx=10, pady=(5, 10))
+        self.results_scroll.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
         # Placeholder text
         self.results_placeholder = ctk.CTkLabel(
@@ -756,6 +1227,112 @@ class QuickTubeApp(ctk.CTk):
             text_color=COLORS["text"]
         )
         self.results_placeholder.pack(pady=50)
+
+        # Right column: Preview panel (fixed height to show all buttons)
+        self.preview_frame = ctk.CTkFrame(results_container, fg_color=COLORS["card_bg"], corner_radius=10, width=320, height=380)
+        self.preview_frame.pack(side="right", fill="y", padx=(5, 0))
+        self.preview_frame.pack_propagate(False)
+
+        preview_header = ctk.CTkLabel(
+            self.preview_frame,
+            text="🎬 Video Preview",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["text"]
+        )
+        preview_header.pack(pady=(10, 5))
+
+        # Large thumbnail/video area
+        self.preview_thumb_frame = ctk.CTkFrame(self.preview_frame, fg_color=COLORS["progress_bg"], width=280, height=158)
+        self.preview_thumb_frame.pack(padx=15, pady=5)
+        self.preview_thumb_frame.pack_propagate(False)
+
+        self.preview_thumb_label = ctk.CTkLabel(
+            self.preview_thumb_frame,
+            text="Click '👁 Preview'\non a video",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        )
+        self.preview_thumb_label.pack(expand=True)
+
+        # VLC player setup (if available)
+        self.vlc_instance = None
+        self.vlc_player = None
+        self.vlc_video_frame = None
+        if VLC_AVAILABLE:
+            try:
+                self.vlc_instance = vlc.Instance('--no-xlib', '--quiet')
+                self.vlc_player = self.vlc_instance.media_player_new()
+            except Exception as e:
+                logger.warning(f"Failed to initialize VLC: {e}")
+                self.vlc_instance = None
+                self.vlc_player = None
+
+        # Preview video title
+        self.preview_title = ctk.CTkLabel(
+            self.preview_frame,
+            text="",
+            font=("Arial", 11, "bold"),
+            text_color=COLORS["text"],
+            wraplength=280
+        )
+        self.preview_title.pack(padx=10, pady=(5, 2))
+
+        # Preview video details
+        self.preview_details = ctk.CTkLabel(
+            self.preview_frame,
+            text="",
+            font=("Arial", 10),
+            text_color=COLORS["accent"],
+            wraplength=280
+        )
+        self.preview_details.pack(padx=10, pady=(0, 5))
+
+        # Preview buttons
+        preview_buttons = ctk.CTkFrame(self.preview_frame, fg_color="transparent")
+        preview_buttons.pack(pady=5)
+
+        # Play 30s preview button (main action)
+        self.preview_play_btn = ctk.CTkButton(
+            preview_buttons,
+            text="▶ Play 30s Preview",
+            command=self._play_preview_clip,
+            fg_color=COLORS["success"],
+            hover_color="#00AA55",
+            font=("Arial", 12, "bold"),
+            width=160,
+            height=35,
+            state="disabled"
+        )
+        self.preview_play_btn.pack(pady=2)
+
+        self.preview_watch_btn = ctk.CTkButton(
+            preview_buttons,
+            text="🔗 Watch on YouTube",
+            command=self._watch_preview_video,
+            fg_color=COLORS["error"],
+            hover_color="#CC0000",
+            font=("Arial", 11, "bold"),
+            width=160,
+            height=30,
+            state="disabled"
+        )
+        self.preview_watch_btn.pack(pady=2)
+
+        self.preview_channel_btn = ctk.CTkButton(
+            preview_buttons,
+            text="📺 Visit Channel",
+            command=self._visit_preview_channel,
+            fg_color=COLORS["warning"],
+            hover_color="#CC8800",
+            font=("Arial", 11, "bold"),
+            width=160,
+            height=30,
+            state="disabled"
+        )
+        self.preview_channel_btn.pack(pady=2)
+
+        # Store current preview video info
+        self.preview_video = None
 
         # Download button
         download_frame = ctk.CTkFrame(self.search_tab_frame, fg_color="transparent")
@@ -1010,6 +1587,63 @@ class QuickTubeApp(ctk.CTk):
         )
         details_label.pack(anchor="w")
 
+        # YouTube links frame
+        links_frame = ctk.CTkFrame(info_frame, fg_color="transparent")
+        links_frame.pack(anchor="w", pady=(2, 0))
+
+        # Video link button
+        video_url = f"https://www.youtube.com/watch?v={result['id']}"
+        video_link_btn = ctk.CTkButton(
+            links_frame,
+            text="🔗 Video",
+            command=lambda url=video_url: webbrowser.open(url),
+            fg_color="transparent",
+            hover_color=COLORS["card_hover"],
+            text_color=COLORS["success"],
+            font=("Arial", 10, "underline"),
+            width=60,
+            height=20,
+            cursor="hand2"
+        )
+        video_link_btn.pack(side="left", padx=(0, 5))
+
+        # Channel link button (if channel_id available)
+        channel_name = result.get('channel', 'Channel')
+        channel_id = result.get('channel_id', '')
+        if channel_id:
+            channel_url = f"https://www.youtube.com/channel/{channel_id}"
+        else:
+            # Fallback to search for channel
+            channel_url = f"https://www.youtube.com/results?search_query={channel_name.replace(' ', '+')}"
+
+        channel_link_btn = ctk.CTkButton(
+            links_frame,
+            text=f"📺 {channel_name[:20]}",
+            command=lambda url=channel_url: webbrowser.open(url),
+            fg_color="transparent",
+            hover_color=COLORS["card_hover"],
+            text_color=COLORS["warning"],
+            font=("Arial", 10, "underline"),
+            width=120,
+            height=20,
+            cursor="hand2"
+        )
+        channel_link_btn.pack(side="left")
+
+        # Preview button - loads video in preview panel
+        preview_btn = ctk.CTkButton(
+            links_frame,
+            text="👁 Preview",
+            command=lambda r=result: self._set_preview_video(r),
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 10, "bold"),
+            width=70,
+            height=20,
+            cursor="hand2"
+        )
+        preview_btn.pack(side="left", padx=(10, 0))
+
     def _load_thumbnail(self, video_id: str, label: ctk.CTkLabel, frame: ctk.CTkFrame):
         """Load thumbnail from YouTube in background thread"""
         try:
@@ -1075,6 +1709,216 @@ class QuickTubeApp(ctk.CTk):
             var.set(False)
         self._update_download_button()
 
+    def _set_preview_video(self, result: Dict):
+        """Set the preview panel to show the selected video"""
+        self.preview_video = result
+
+        # Update title
+        title = result.get('title', 'Unknown')
+        if len(title) > 60:
+            title = title[:57] + "..."
+        self.preview_title.configure(text=title)
+
+        # Update details
+        details = f"{result.get('duration', '')} | {result.get('channel', '')} | {result.get('views', '')} views"
+        self.preview_details.configure(text=details)
+
+        # Enable all buttons
+        self.preview_play_btn.configure(state="normal")
+        self.preview_watch_btn.configure(state="normal")
+        self.preview_channel_btn.configure(state="normal")
+
+        # Load larger thumbnail
+        if PIL_AVAILABLE:
+            thread = threading.Thread(
+                target=self._load_preview_thumbnail,
+                args=(result["id"],)
+            )
+            thread.daemon = True
+            thread.start()
+
+    def _load_preview_thumbnail(self, video_id: str):
+        """Load larger thumbnail for preview panel"""
+        try:
+            # YouTube thumbnail URL (high quality - 480x360)
+            thumb_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+            # Download thumbnail
+            with urllib.request.urlopen(thumb_url, timeout=5) as response:
+                data = response.read()
+
+            # Create PIL image and resize to fit preview area
+            pil_image = Image.open(BytesIO(data))
+            pil_image = pil_image.resize((280, 158), Image.Resampling.LANCZOS)
+
+            # Create CTkImage
+            ctk_image = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(280, 158))
+
+            # Update UI on main thread
+            self.after(0, lambda: self._display_preview_thumbnail(ctk_image))
+
+        except Exception as e:
+            self.after(0, lambda: self.preview_thumb_label.configure(text="Could not load\nthumbnail", image=None))
+
+    def _display_preview_thumbnail(self, ctk_image):
+        """Display the preview thumbnail"""
+        try:
+            self.preview_thumb_label.configure(image=ctk_image, text="")
+        except Exception:
+            pass
+
+    def _watch_preview_video(self):
+        """Open the preview video on YouTube"""
+        if self.preview_video:
+            video_url = f"https://www.youtube.com/watch?v={self.preview_video['id']}"
+            webbrowser.open(video_url)
+
+    def _visit_preview_channel(self):
+        """Visit the channel of the preview video"""
+        if self.preview_video:
+            channel_id = self.preview_video.get('channel_id', '')
+            channel_name = self.preview_video.get('channel', 'Channel')
+            if channel_id:
+                channel_url = f"https://www.youtube.com/channel/{channel_id}"
+            else:
+                channel_url = f"https://www.youtube.com/results?search_query={channel_name.replace(' ', '+')}"
+            webbrowser.open(channel_url)
+
+    def _play_preview_clip(self):
+        """Download and play a 30-second preview clip"""
+        if not self.preview_video:
+            return
+
+        # Disable button while downloading
+        self.preview_play_btn.configure(state="disabled", text="⏳ Loading...")
+
+        # Run in background thread
+        thread = threading.Thread(target=self._download_and_play_preview)
+        thread.daemon = True
+        thread.start()
+
+    def _download_and_play_preview(self):
+        """Download 30-second clip and play it"""
+        try:
+            video_id = self.preview_video['id']
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+            # Create temp file for preview
+            preview_file = os.path.join(TEMP_FOLDER, f"preview_{video_id}.mp4")
+
+            # If preview already exists and is recent, just play it
+            if os.path.exists(preview_file):
+                self.after(0, lambda: self._play_video_file(preview_file))
+                return
+
+            # Download 30 seconds starting from 10 seconds in (to skip intros)
+            # Using yt-dlp with download-sections
+            cmd = [
+                "yt-dlp",
+                "--download-sections", "*10-40",  # 30 seconds from 10s to 40s
+                "-f", "bv*[height<=480]+ba/b[height<=480]/b",  # Lower quality for quick preview
+                "-o", preview_file,
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+            ]
+            cmd.extend(self._get_cookie_args())
+            cmd.append(video_url)
+
+            logger.info(f"Downloading preview clip: {' '.join(cmd)}")
+
+            # Run yt-dlp
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            if result.returncode == 0 and os.path.exists(preview_file):
+                self.after(0, lambda: self._play_video_file(preview_file))
+            else:
+                # Fallback: open in browser at 10 second mark
+                logger.warning(f"Preview download failed, opening in browser. Error: {result.stderr}")
+                fallback_url = f"https://www.youtube.com/watch?v={video_id}&t=10"
+                self.after(0, lambda: webbrowser.open(fallback_url))
+
+        except subprocess.TimeoutExpired:
+            logger.error("Preview download timed out")
+            # Fallback to browser
+            fallback_url = f"https://www.youtube.com/watch?v={self.preview_video['id']}&t=10"
+            self.after(0, lambda: webbrowser.open(fallback_url))
+        except Exception as e:
+            logger.error(f"Preview error: {e}")
+            # Fallback to browser
+            fallback_url = f"https://www.youtube.com/watch?v={self.preview_video['id']}&t=10"
+            self.after(0, lambda: webbrowser.open(fallback_url))
+        finally:
+            # Re-enable button
+            self.after(0, lambda: self.preview_play_btn.configure(state="normal", text="▶ Play 30s Preview"))
+
+    def _play_video_file(self, filepath):
+        """Play a video file in the embedded VLC player"""
+        try:
+            if not os.path.exists(filepath):
+                messagebox.showerror("Error", "Preview file not found")
+                return
+
+            # Use embedded VLC if available
+            if VLC_AVAILABLE and self.vlc_player:
+                self._play_in_embedded_vlc(filepath)
+            else:
+                # Fallback to external player
+                os.startfile(filepath)
+        except Exception as e:
+            logger.error(f"Failed to play video: {e}")
+            messagebox.showerror("Error", f"Could not play video: {e}")
+
+    def _play_in_embedded_vlc(self, filepath):
+        """Play video in the embedded VLC player inside the preview panel"""
+        try:
+            # Stop any currently playing video
+            if self.vlc_player.is_playing():
+                self.vlc_player.stop()
+
+            # Hide thumbnail label and show video frame
+            self.preview_thumb_label.pack_forget()
+
+            # Create video frame if not exists
+            if not self.vlc_video_frame:
+                import tkinter as tk
+                self.vlc_video_frame = tk.Frame(self.preview_thumb_frame, bg='black', width=280, height=158)
+                self.vlc_video_frame.pack(fill='both', expand=True)
+                self.vlc_video_frame.update()
+
+                # Get the window handle and set VLC to use it
+                handle = self.vlc_video_frame.winfo_id()
+                self.vlc_player.set_hwnd(handle)
+
+            # Make sure video frame is visible
+            self.vlc_video_frame.pack(fill='both', expand=True)
+
+            # Create media and play
+            media = self.vlc_instance.media_new(filepath)
+            self.vlc_player.set_media(media)
+            self.vlc_player.play()
+
+            logger.info(f"Playing preview in embedded VLC: {filepath}")
+
+        except Exception as e:
+            logger.error(f"Embedded VLC playback failed: {e}")
+            # Fallback to external player
+            os.startfile(filepath)
+
+    def _stop_preview_playback(self):
+        """Stop the embedded video playback and show thumbnail again"""
+        try:
+            if self.vlc_player and self.vlc_player.is_playing():
+                self.vlc_player.stop()
+
+            # Hide video frame and show thumbnail
+            if self.vlc_video_frame:
+                self.vlc_video_frame.pack_forget()
+
+            self.preview_thumb_label.pack(expand=True)
+        except Exception as e:
+            logger.error(f"Error stopping preview: {e}")
+
     def _update_download_button(self):
         """Update the download button text and state"""
         selected_count = sum(1 for var in self.search_vars.values() if var.get())
@@ -1128,17 +1972,16 @@ class QuickTubeApp(ctk.CTk):
             self._append_search_progress(f"    URL: {video['url']}\n")
 
             try:
+                node_path = self._find_node_path()
                 cmd = [
                     "yt-dlp",
                     "-o", f"{DOWNLOAD_FOLDER}/%(title)s.%(ext)s",
                     "--no-playlist",
                     "--merge-output-format", self.settings.get("output_format", "mp4"),
                     "--newline",  # Better progress output
-                    # YouTube bot detection bypass settings
-                    "--js-runtimes", "node",
-                    "--remote-components", "ejs:github",
-                    "--extractor-args", "youtube:player-client=mweb",
-                ]
+                    # YouTube extraction requires JavaScript runtime
+                    "--js-runtimes", f"node:{node_path}" if node_path else "node",
+                                    ]
                 cmd.extend(self._get_cookie_args())
                 cmd.append(video["url"])
 
@@ -1148,10 +1991,10 @@ class QuickTubeApp(ctk.CTk):
                 else:
                     quality = self.settings.get("video_quality", "best")
                     if quality == "best":
-                        cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                        cmd.extend(["-f", "bv*+ba/b"])  # Best video+audio, or best combined
                         cmd.extend(["-S", "res,vcodec:h264"])
                     else:
-                        cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                        cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])  # Best video at quality+audio, or best combined
 
                 process = subprocess.Popen(
                     cmd,
@@ -1307,16 +2150,46 @@ class QuickTubeApp(ctk.CTk):
         ]
         return any(re.search(pattern, url) for pattern in patterns)
 
+    def _cleanup_old_temp_files(self, max_age_hours=24):
+        """Clean up old video files from temp folder to prevent cache confusion"""
+        try:
+            import time
+            cutoff_time = time.time() - (max_age_hours * 3600)
+            cleaned = 0
+            for f in os.listdir(TEMP_FOLDER):
+                if f.endswith(('.mp4', '.webm', '.mkv', '.m4a')):
+                    filepath = os.path.join(TEMP_FOLDER, f)
+                    if os.path.getmtime(filepath) < cutoff_time:
+                        try:
+                            os.remove(filepath)
+                            cleaned += 1
+                            logger.info(f"Cleaned old temp file: {f}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove old temp file {f}: {e}")
+            if cleaned > 0:
+                logger.info(f"Cleaned up {cleaned} old temp files")
+        except Exception as e:
+            logger.warning(f"Temp cleanup failed: {e}")
+
     def _download_video_thread(self, url):
         """Download video in separate thread - downloads to temp first, then moves to final location"""
         temp_file = None
+        all_output = []  # Capture all output for logging
         try:
             self.is_downloading = True
+
+            # Clean up old cached files to prevent wrong file being moved
+            self._cleanup_old_temp_files(max_age_hours=24)
+
             self.log_message(f"\n[START] Downloading video...")
             self.log_message(f"[URL] {url}")
             self.log_message(f"[TEMP] Downloading to temp folder first...\n")
 
             # Build yt-dlp command - download to TEMP folder
+            # Find node.exe path for yt-dlp JavaScript runtime
+            node_path = self._find_node_path()
+            logger.info(f"Node.js path: {node_path}")
+
             cmd = [
                 "yt-dlp",
                 "-o", f"{TEMP_FOLDER}/%(title)s.%(ext)s",
@@ -1324,15 +2197,11 @@ class QuickTubeApp(ctk.CTk):
                 "--progress",
                 "--newline",
                 "--no-colors",
-                "--console-title", "",
                 "--merge-output-format", self.settings.get("output_format", "mp4"),  # Force mp4 output
-                # YouTube bot detection bypass settings
-                "--js-runtimes", "node",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player-client=mweb",
-            ]
+                # YouTube extraction requires JavaScript runtime (node or deno)
+                "--js-runtimes", f"node:{node_path}" if node_path else "node",
+                            ]
             cmd.extend(self._get_cookie_args())
-            cmd.append(url)
 
             # Add quality options
             if self.settings.get("audio_only"):
@@ -1341,11 +2210,18 @@ class QuickTubeApp(ctk.CTk):
                 quality = self.settings.get("video_quality", "best")
                 if quality == "best":
                     # Get the absolute highest quality video and audio
-                    cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                    cmd.extend(["-f", "bv*+ba/b"])  # Best video+audio, or best combined
                     # Ensure we prefer higher resolution
                     cmd.extend(["-S", "res,vcodec:h264"])
                 else:
-                    cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                    cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])  # Best video at quality+audio, or best combined
+
+            # Add URL at the end (must be last argument)
+            cmd.append(url)
+
+            # Log the full command
+            logger.info(f"Download URL: {url}")
+            logger.info(f"Full command: {' '.join(cmd)}")
 
             # Run yt-dlp
             process = subprocess.Popen(
@@ -1366,7 +2242,21 @@ class QuickTubeApp(ctk.CTk):
                 if not line:
                     continue
 
-                # Extract temp file path
+                # Log ALL lines to file for debugging
+                all_output.append(line)
+                logger.debug(f"yt-dlp: {line}")
+
+                # Log errors and warnings prominently
+                if "ERROR" in line or "error" in line.lower():
+                    logger.error(f"yt-dlp ERROR: {line}")
+                    self.log_message(f"[ERROR] {line}")
+                    continue
+
+                if "WARNING" in line or "warning" in line.lower():
+                    logger.warning(f"yt-dlp WARNING: {line}")
+                    continue
+
+                # Extract temp file path from Destination line
                 if "[download] Destination:" in line:
                     match = re.search(r'Destination: (.+)', line)
                     if match:
@@ -1378,6 +2268,21 @@ class QuickTubeApp(ctk.CTk):
                         if video_title == "Video":  # Only set on first occurrence
                             video_title = clean_title
                             self.log_message(f"[VIDEO] {video_title}")
+                            logger.info(f"Video title: {video_title}")
+                    continue
+
+                # Extract file path from "has already been downloaded" line (for cached files)
+                if "has already been downloaded" in line:
+                    match = re.search(r'\[download\] (.+) has already been downloaded', line)
+                    if match:
+                        cached_file_path = match.group(1)
+                        temp_file_path = cached_file_path  # Store the actual cached file path
+                        stem = Path(cached_file_path).stem
+                        clean_title = re.sub(r'\.f\d+$', '', stem)
+                        if video_title == "Video":
+                            video_title = clean_title
+                            self.log_message(f"[VIDEO] {video_title} (cached)")
+                            logger.info(f"Video title from cache: {video_title}")
                     continue
 
                 # Handle completion - only show once when reaching 100%
@@ -1404,47 +2309,63 @@ class QuickTubeApp(ctk.CTk):
                     continue
 
             process.wait()
+            logger.info(f"yt-dlp exit code: {process.returncode}")
 
             # Check if download was successful
             if process.returncode != 0 and last_percent < 99:
                 self.log_message(f"\n[FAILED] Download failed with error code {process.returncode}\n")
+                logger.error(f"Download failed for {url} with exit code {process.returncode}")
+                logger.error(f"Full yt-dlp output:\n" + "\n".join(all_output[-50:]))  # Last 50 lines
                 return
 
-            # Find the merged file (without format codes like .f399, .f251)
-            all_files = os.listdir(TEMP_FOLDER)
+            # Find the downloaded file
+            # PRIORITY 1: Use temp_file_path if we got it from yt-dlp output
+            if temp_file_path and os.path.exists(temp_file_path):
+                temp_file = temp_file_path
+                logger.info(f"Using file path from yt-dlp output: {temp_file}")
+            else:
+                # PRIORITY 2: Search for the file by title
+                all_files = os.listdir(TEMP_FOLDER)
 
-            # First try exact match
-            merged_files = [f for f in all_files
-                           if f.startswith(video_title)
-                           and not re.search(r'\.f\d+\.(webm|mp4|m4a)$', f)]
-
-            # If no exact match, try fuzzy match (first 20 chars, handles special characters)
-            if not merged_files:
-                # Use first 20 characters for matching (handles : vs ： differences)
-                title_prefix = video_title[:20] if len(video_title) > 20 else video_title
+                # First try exact match
                 merged_files = [f for f in all_files
-                               if f[:20].replace('：', ' ').replace(':', ' ').strip() == title_prefix.strip()
+                               if f.startswith(video_title)
                                and not re.search(r'\.f\d+\.(webm|mp4|m4a)$', f)]
 
-            # If still no match, just get any mp4/webm file (not a stream file)
-            if not merged_files:
-                merged_files = [f for f in all_files
-                               if f.endswith(('.mp4', '.webm', '.mkv'))
-                               and not re.search(r'\.f\d+\.(webm|mp4|m4a)$', f)]
+                # If no exact match, try fuzzy match (first 20 chars, handles special characters)
+                if not merged_files:
+                    # Use first 20 characters for matching (handles : vs ： differences)
+                    title_prefix = video_title[:20] if len(video_title) > 20 else video_title
+                    merged_files = [f for f in all_files
+                                   if f[:20].replace('：', ' ').replace(':', ' ').strip() == title_prefix.strip()
+                                   and not re.search(r'\.f\d+\.(webm|mp4|m4a)$', f)]
 
-            if not merged_files:
-                self.log_message(f"\n[ERROR] Merged file not found. Files in temp: {all_files}\n")
-                self.log_message(f"[DEBUG] Looking for files starting with: {video_title}\n")
-                return
+                # PRIORITY 3: Fallback to NEWEST mp4/webm file (sorted by modification time)
+                if not merged_files:
+                    video_files = [f for f in all_files
+                                   if f.endswith(('.mp4', '.webm', '.mkv'))
+                                   and not re.search(r'\.f\d+\.(webm|mp4|m4a)$', f)]
+                    if video_files:
+                        # Sort by modification time (newest first)
+                        video_files.sort(key=lambda f: os.path.getmtime(os.path.join(TEMP_FOLDER, f)), reverse=True)
+                        merged_files = [video_files[0]]  # Take the newest one
+                        logger.warning(f"Using fallback: newest file {merged_files[0]} (no title match found)")
+                        self.log_message(f"[WARN] Using newest file as fallback")
 
-            # Get the merged file (should be only one)
-            temp_file = os.path.join(TEMP_FOLDER, merged_files[0])
+                if not merged_files:
+                    self.log_message(f"\n[ERROR] Merged file not found. Files in temp: {all_files}\n")
+                    self.log_message(f"[DEBUG] Looking for files starting with: {video_title}\n")
+                    return
+
+                # Get the merged file
+                temp_file = os.path.join(TEMP_FOLDER, merged_files[0])
             file_extension = Path(temp_file).suffix
 
-            # Use the actual filename from the merged file (handles special characters correctly)
-            actual_filename = Path(merged_files[0]).stem
+            # Use the actual filename from the temp file (handles special characters correctly)
+            actual_filename = Path(temp_file).stem
 
             # Clean up partial stream files (.f399, .f251, etc.)
+            all_files = os.listdir(TEMP_FOLDER)
             for f in all_files:
                 if re.search(r'\.f\d+\.(webm|mp4|m4a)$', f):
                     try:
@@ -1482,6 +2403,9 @@ class QuickTubeApp(ctk.CTk):
 
         except Exception as e:
             self.log_message(f"\n[ERROR] Download failed: {e}\n")
+            logger.exception(f"Download exception for {url}: {e}")
+            if all_output:
+                logger.error(f"Last yt-dlp output before error:\n" + "\n".join(all_output[-30:]))
         finally:
             # Clean up temp file if it still exists
             if temp_file and os.path.exists(temp_file):
@@ -1501,6 +2425,7 @@ class QuickTubeApp(ctk.CTk):
             self.log_message(f"[INFO] This may take a while...\n")
 
             # Build yt-dlp command for channel
+            node_path = self._find_node_path()
             cmd = [
                 "yt-dlp",
                 "-o", f"{DOWNLOAD_FOLDER}/%(uploader)s/%(title)s.%(ext)s",
@@ -1510,11 +2435,9 @@ class QuickTubeApp(ctk.CTk):
                 "--console-title", "",
                 "--yes-playlist",
                 "--merge-output-format", self.settings.get("output_format", "mp4"),  # Force mp4 output
-                # YouTube bot detection bypass settings
-                "--js-runtimes", "node",
-                "--remote-components", "ejs:github",
-                "--extractor-args", "youtube:player-client=mweb",
-            ]
+                # YouTube extraction requires JavaScript runtime
+                "--js-runtimes", f"node:{node_path}" if node_path else "node",
+                            ]
             cmd.extend(self._get_cookie_args())
             cmd.append(url)
 
@@ -1525,11 +2448,11 @@ class QuickTubeApp(ctk.CTk):
                 quality = self.settings.get("video_quality", "best")
                 if quality == "best":
                     # Get the absolute highest quality video and audio
-                    cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                    cmd.extend(["-f", "bv*+ba/b"])  # Best video+audio, or best combined
                     # Ensure we prefer higher resolution
                     cmd.extend(["-S", "res,vcodec:h264"])
                 else:
-                    cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                    cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])  # Best video at quality+audio, or best combined
 
             # Run yt-dlp
             process = subprocess.Popen(
@@ -1644,6 +2567,7 @@ class QuickTubeApp(ctk.CTk):
                 unique_name = f"{base_name} ({counter})"
 
             # Build command with custom output template
+            node_path = self._find_node_path()
             cmd = [
                 "yt-dlp",
                 "-o", f"{DOWNLOAD_FOLDER}/{unique_name}.%(ext)s",
@@ -1652,7 +2576,8 @@ class QuickTubeApp(ctk.CTk):
                 "--newline",
                 "--no-colors",
                 "--console-title", "",
-                url
+                "--js-runtimes", f"node:{node_path}" if node_path else "node",
+                                url
             ]
 
             # Add quality options
@@ -1662,11 +2587,11 @@ class QuickTubeApp(ctk.CTk):
                 quality = self.settings.get("video_quality", "best")
                 if quality == "best":
                     # Get the absolute highest quality video and audio
-                    cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                    cmd.extend(["-f", "bv*+ba/b"])  # Best video+audio, or best combined
                     # Ensure we prefer higher resolution
                     cmd.extend(["-S", "res,vcodec:h264"])
                 else:
-                    cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                    cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])  # Best video at quality+audio, or best combined
 
             # Run download
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -1708,6 +2633,7 @@ class QuickTubeApp(ctk.CTk):
             self.log_message(f"[URL] {url}\n")
 
             # Build command with force overwrite
+            node_path = self._find_node_path()
             cmd = [
                 "yt-dlp",
                 "-o", f"{DOWNLOAD_FOLDER}/%(title)s.%(ext)s",
@@ -1717,7 +2643,8 @@ class QuickTubeApp(ctk.CTk):
                 "--newline",
                 "--no-colors",
                 "--console-title", "",
-                url
+                "--js-runtimes", f"node:{node_path}" if node_path else "node",
+                                url
             ]
 
             # Add quality options
@@ -1727,11 +2654,11 @@ class QuickTubeApp(ctk.CTk):
                 quality = self.settings.get("video_quality", "best")
                 if quality == "best":
                     # Get the absolute highest quality video and audio
-                    cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                    cmd.extend(["-f", "bv*+ba/b"])  # Best video+audio, or best combined
                     # Ensure we prefer higher resolution
                     cmd.extend(["-S", "res,vcodec:h264"])
                 else:
-                    cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                    cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])  # Best video at quality+audio, or best combined
 
             # Run download
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -2018,7 +2945,20 @@ class QuickTubeApp(ctk.CTk):
 
     def open_download_folder(self):
         """Open downloads folder in Windows Explorer"""
-        os.startfile(DOWNLOAD_FOLDER)
+        try:
+            if os.path.exists(DOWNLOAD_FOLDER):
+                os.startfile(DOWNLOAD_FOLDER)
+            else:
+                # Create folder if it doesn't exist
+                os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+                os.startfile(DOWNLOAD_FOLDER)
+        except Exception as e:
+            logger.error(f"Failed to open folder: {e}")
+            # Fallback: try subprocess
+            try:
+                subprocess.Popen(['explorer', DOWNLOAD_FOLDER])
+            except Exception as e2:
+                messagebox.showerror("Error", f"Could not open folder: {e2}")
 
     def show_file_exists_dialog(self, url, title):
         """Show dialog when file already exists"""
