@@ -25,8 +25,9 @@ QuickTube is a simple, clean YouTube downloader with a GUI interface. Just paste
 
 ### Visual Analysis Tab (New in 2026-01-21)
 - **AI-Powered Physical Comedy Detection** - Detect falls, slaps, chases, slapstick
-- **CLIP Model (Recommended)** - Semantic matching for slapstick comedy (29% accuracy on Benny Hill)
-- **SlowFast Model (Optional)** - Kinetics-400 action recognition
+- **Scene-Based Analysis** - PySceneDetect + perceptual hash deduplication
+- **CLIP Model (Current)** - Semantic matching (limited accuracy for specific actions)
+- **Future: Qwen2.5-VL-7B** - Recommended upgrade for true action understanding
 - **Multi-Select Action Filters** - Choose categories: Slapstick, Falls, Fighting, Chases, etc.
 - **Configurable Thresholds** - Min clip length, min confidence, max duration
 - **Download Detected Clips** - Save clips directly to `visual_clips` folder
@@ -148,47 +149,205 @@ When a compatibility issue is detected, QuickTube offers:
 
 ## Visual Analysis - How It Works
 
-The Visual Analysis tab uses AI to detect physical comedy moments in videos.
+The Visual Analysis tab uses AI to detect physical comedy moments in videos with automatic scene detection and duplicate removal.
 
-### Workflow
+### Workflow (Single Video - Scene-Based Analysis)
 1. **Search** - Enter a search query (e.g., "benny hill slapstick") or browse local files
-2. **Select Videos** - Check videos to analyze (can re-analyze previously processed)
-3. **Set Filters** - Choose action categories, min clip length (5s default), min confidence (15%)
-4. **Choose Model** - CLIP (recommended) or SlowFast
-5. **Analyze** - AI processes videos and detects comedy moments
-6. **Download** - Select clips and save to `D:\stacher_downloads\visual_clips\`
+2. **Select ONE Video** - Check a single video to analyze with full progress tracking
+3. **Set Confidence** - Set minimum confidence threshold (default 15%)
+4. **Analyze** - Click "Analyze Selected Videos" to start 6-step process:
+   - Step 1: Download video
+   - Step 2: Detect scene boundaries (PySceneDetect)
+   - Step 3: Extract thumbnails from each scene
+   - Step 4: Remove duplicate scenes (perceptual hash deduplication)
+   - Step 5: Classify scenes with CLIP AI
+   - Step 6: Build clip candidates
+5. **Preview** - View thumbnail grid with scene info, click "Preview" to watch clips
+6. **Select & Download** - Check clips to keep, click "Download Selected Clips"
+
+### Progress Indicators
+- Visual step indicators (1-6) showing completed/current/pending steps
+- Progress bar showing overall completion
+- Spinner animation during processing
+- Real-time status messages
+
+### Multi-Video Batch Analysis
+When multiple videos are selected, uses the original batch processing mode without scene-based deduplication.
 
 ### Detection Models
 
-| Model | Best For | How It Works |
-|-------|----------|--------------|
-| **CLIP** | Slapstick comedy, semantic concepts | Matches frames to text descriptions like "person slapping someone" |
-| SlowFast | Sports actions, specific movements | Kinetics-400 trained action recognition |
+| Model | Best For | How It Works | Accuracy |
+|-------|----------|--------------|----------|
+| **CLIP** (Current) | Visual similarity filtering | Matches frames to text descriptions | ~29% on slapstick |
+| SlowFast | Sports, defined movements | Kinetics-400 action classes | 0.27% on slapstick |
+| **Qwen2.5-VL-7B** (Planned) | True action understanding | Temporal video reasoning | High (recommended) |
 
-### CLIP Detection Categories (23 prompts)
+**Note:** CLIP cannot reliably detect specific actions like "slaps" - see limitations section below.
+
+### CLIP Detection Categories (17 prompts)
 - **Slapstick**: "slapstick comedy scene", "person slapping another person", "comedic fighting"
-- **Falls**: "person falling down", "someone tripping", "faceplanting", "pratfall"
-- **Chases**: "people running and chasing", "comedy chase scene", "fast motion chase"
+- **Falls**: "person falling down", "someone tripping", "pratfall"
+- **Chases**: "people running and chasing", "comedy chase scene", "fast motion"
 - **Physical Humor**: "pie in face", "being pushed", "knocked over", "silly movements"
+- **Excluded**: "dialogue", "scenery", "credits" (auto-filtered)
 
 ### Requirements for Visual Analysis
 ```bash
 # Separate conda environment required
 conda create -n video_analysis python=3.10
 conda activate video_analysis
-pip install torch torchvision pytorchvideo pillow numpy
+pip install torch torchvision pytorchvideo pillow numpy imagehash
 pip install git+https://github.com/openai/CLIP.git
+pip install scenedetect[opencv]
+```
+
+## Visual Analysis - Limitations & Future Improvements
+
+### Current CLIP Model Limitations
+
+After extensive testing with Benny Hill slapstick videos, we discovered fundamental limitations with the CLIP-based approach:
+
+**The Problem:**
+- CLIP matches **visual aesthetics**, not **temporal actions**
+- A single frame of a "slap" doesn't look distinctly like a slap
+- CLIP sees "two people close together" rather than "someone slapping someone"
+- 29% accuracy is insufficient for reliable action detection
+- Many false positives from visually similar but non-action scenes
+
+**Why CLIP Fails for Action Detection:**
+- CLIP was trained on image-caption pairs, not video action sequences
+- Physical actions like slaps, falls, and chases require **temporal context** (before/during/after)
+- A mid-slap frame looks similar to someone waving or gesturing
+
+### Research: Alternative Approaches (2026-01-21)
+
+We researched several alternatives for improved action detection. Hardware available: **Dual RTX 4090 server** with vLLM/Ollama, plus API accounts (Anthropic, Google, OpenAI).
+
+#### Option 1: Qwen2.5-VL-7B (STRONGLY RECOMMENDED)
+
+**Why This Is The Preferred Option:**
+- True video understanding with temporal reasoning
+- Can process multiple frames and understand actions
+- Natural language queries: "Find all scenes where someone gets slapped"
+- Returns timestamps and descriptions
+- Runs locally on 4090 (14-18GB VRAM)
+
+**Specifications:**
+| Property | Value |
+|----------|-------|
+| Model Size | 7B parameters |
+| VRAM Required | 14-18GB (fits single 4090) |
+| Framework | vLLM, Ollama, or transformers |
+| Input | Video frames + text prompt |
+| Output | Descriptions with timestamps |
+
+**Implementation Approach:**
+```python
+# Example workflow
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+
+model = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+
+# Process video in chunks
+prompt = "Identify all scenes containing: slaps, falls, chases, physical comedy. Return timestamps."
+result = model.generate(video_frames, prompt)
+# Returns: "0:42-0:45: Man slaps another man on the back of the head"
+```
+
+**Advantages:**
+- Runs entirely locally (no API costs)
+- True temporal understanding
+- Can be fine-tuned on slapstick examples
+- Supports natural language queries
+- High accuracy on action recognition benchmarks
+
+#### Option 2: Gemini 2.5 Pro API
+
+**Best for highest accuracy without local GPU:**
+- Native video+audio processing
+- Can hear slap sounds AND see actions
+- Returns timestamps
+- User already has Gemini account
+
+| Property | Value |
+|----------|-------|
+| Input | Full video file (up to 2 hours) |
+| Audio Analysis | Yes - detects slap sounds, screams |
+| Timestamps | Yes - precise to seconds |
+| Cost | ~$0.001/second of video |
+
+**Advantages:**
+- Highest accuracy (video + audio combined)
+- No local GPU requirements
+- Simple API integration
+
+**Disadvantages:**
+- Ongoing API costs
+- Requires internet connection
+- Data sent to Google servers
+
+#### Option 3: Audio Detection (PANNs / Whisper-AT)
+
+**For detecting actions by sound:**
+- Slaps have distinct audio signatures
+- Screams, crashes, running footsteps
+- Can complement visual analysis
+
+| Model | Purpose | Size |
+|-------|---------|------|
+| PANNs | Audio event detection | 80MB |
+| Whisper-AT | Audio tagging + transcription | 1.5GB |
+
+**Best Used:** As a secondary signal combined with visual analysis
+
+#### Option 4: MMAction2 (Specialized Action Detection)
+
+**For fine-grained temporal action localization:**
+- SlowFast, TimeSformer, VideoMAE models
+- Requires training on slapstick dataset
+- More complex setup
+
+**Best Used:** If building a specialized slapstick detector with labeled training data
+
+### Recommended Upgrade Path
+
+1. **Phase 1 (Immediate):** Keep current CLIP system for basic filtering
+2. **Phase 2 (Next):** Implement Qwen2.5-VL-7B for accurate action detection
+3. **Phase 3 (Optional):** Add audio detection for slap sounds as secondary signal
+4. **Phase 4 (Optional):** Fine-tune on labeled slapstick clips for highest accuracy
+
+### Hardware Requirements for Qwen2.5-VL-7B
+
+```
+Minimum:
+- RTX 4090 (24GB) or RTX 3090 (24GB)
+- 32GB system RAM
+- 50GB disk space for model
+
+Recommended (Current Server):
+- Dual RTX 4090 (48GB total)
+- vLLM for optimized inference
+- Can process multiple videos in parallel
 ```
 
 ## Recent Updates
 
-### 2026-01-21 - Visual Analysis CLIP Integration
-- **Added CLIP model** - Much better slapstick detection (29% vs 0.27% for SlowFast)
-- **Removed clip merging** - Each detection is individual, not merged together
-- **Fixed re-analysis** - Previously analyzed videos now re-analyze when selected
-- **Fixed min duration filter** - Short clips are now skipped, not extended
-- **Fixed download buttons** - Moved to Step 4 header, always visible
-- **Model selector dropdown** - Choose between CLIP (recommended) and SlowFast
+### 2026-01-21 - Research: Action Detection Alternatives
+- **CLIP Limitations Documented** - CLIP cannot reliably detect temporal actions (slaps, falls)
+- **Research Completed** - Evaluated Qwen2.5-VL-7B, Gemini API, MMAction2, audio detection
+- **Qwen2.5-VL-7B Recommended** - True video understanding with temporal reasoning
+- **Hardware Ready** - Dual RTX 4090 server available for local inference
+- **Upgrade Path Defined** - Phased approach from CLIP to Qwen2.5-VL-7B
+
+### 2026-01-21 - Scene-Based Analysis with Deduplication
+- **Scene Detection** - Uses PySceneDetect to find natural scene boundaries (not frame-by-frame)
+- **Perceptual Hash Deduplication** - Removes duplicate/similar scenes automatically using imagehash
+- **6-Step Progress UI** - Visual step indicators, progress bar, and spinner animations
+- **Thumbnail Preview Grid** - See scene thumbnails before downloading
+- **Preview Clips** - Click to preview any scene with ffplay before saving
+- **User Selection** - Check/uncheck scenes to include in download
+- **CLIP Model** - Basic slapstick filtering (29% accuracy - limited for specific actions)
+- **Download Selected** - Save only the scenes you want to `visual_clips` folder
 
 ### 2026-01-20 - Visual Analysis Tab Added
 - New tab for AI-powered physical comedy detection
@@ -247,6 +406,7 @@ D:\stacher_downloads\
 ```
 D:\QuickTube\
 ├── quicktube.py           # Main application
+├── scene_analysis.py      # Scene-based analysis (PySceneDetect + deduplication)
 ├── visual_analysis.py     # Visual analysis module (CLIP + SlowFast)
 ├── audio_detection.py     # Audio detection module
 ├── codec_utils.py         # Codec detection utilities
@@ -254,6 +414,7 @@ D:\QuickTube\
 ├── download_history.json  # Download history
 ├── processed_videos.json  # Visual analysis cache
 ├── temp/                  # Temporary download/frame folder
+│   └── scene_cache/       # Downloaded videos and thumbnails for analysis
 ├── logs/                  # Application logs
 ├── README.md              # This file
 └── FIXES.md               # Bug fix documentation

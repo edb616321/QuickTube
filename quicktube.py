@@ -74,7 +74,7 @@ except ImportError:
     AUDIO_DETECTION_AVAILABLE = False
     print("[QuickTube] Warning: audio_detection not available")
 
-# Import visual analysis utilities
+# Import visual analysis utilities (legacy)
 try:
     from visual_analysis import (
         analyze_video as visual_analyze_video,
@@ -90,6 +90,21 @@ try:
 except ImportError:
     VISUAL_ANALYSIS_AVAILABLE = False
     print("[QuickTube] Warning: visual_analysis not available")
+
+# Import new scene-based analysis (v2)
+try:
+    from scene_analysis import (
+        analyze_video_scenes,
+        save_selected_clips,
+        extract_clip,
+        SceneCandidate,
+        AnalysisProgress,
+        VideoAnalysisResult as SceneAnalysisResult
+    )
+    SCENE_ANALYSIS_AVAILABLE = True
+except ImportError:
+    SCENE_ANALYSIS_AVAILABLE = False
+    print("[QuickTube] Warning: scene_analysis not available")
 
 # Constants
 DOWNLOAD_FOLDER = r"D:\stacher_downloads"
@@ -2517,12 +2532,537 @@ class QuickTubeApp(ctk.CTk):
             height=34
         ).pack(side="right", padx=5)
 
-        # Results scroll
+        # === Progress Section (for scene-based analysis) ===
+        self.visual_progress_frame = ctk.CTkFrame(results_frame, fg_color=COLORS["progress_bg"], corner_radius=8)
+        self.visual_progress_frame.pack(fill="x", padx=15, pady=(0, 10))
+        self.visual_progress_frame.pack_forget()  # Hidden by default
+
+        # Step indicators row
+        self.visual_steps_frame = ctk.CTkFrame(self.visual_progress_frame, fg_color="transparent")
+        self.visual_steps_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+        self.visual_step_labels = []
+        step_names = ["Download", "Detect Scenes", "Deduplicate", "Classify", "Preview", "Save"]
+        for i, name in enumerate(step_names):
+            step_frame = ctk.CTkFrame(self.visual_steps_frame, fg_color="transparent")
+            step_frame.pack(side="left", expand=True)
+
+            # Circle indicator
+            indicator = ctk.CTkLabel(
+                step_frame,
+                text=f"{i+1}",
+                font=("Arial", 11, "bold"),
+                width=28,
+                height=28,
+                fg_color=COLORS["card_hover"],
+                corner_radius=14,
+                text_color=COLORS["text"]
+            )
+            indicator.pack()
+
+            # Step name
+            label = ctk.CTkLabel(
+                step_frame,
+                text=name,
+                font=("Arial", 9),
+                text_color=COLORS["text"]
+            )
+            label.pack()
+
+            self.visual_step_labels.append((indicator, label))
+
+        # Progress bar
+        self.visual_progress_bar = ctk.CTkProgressBar(
+            self.visual_progress_frame,
+            fg_color=COLORS["card_hover"],
+            progress_color=COLORS["accent"],
+            height=20
+        )
+        self.visual_progress_bar.pack(fill="x", padx=10, pady=5)
+        self.visual_progress_bar.set(0)
+
+        # Progress status text
+        self.visual_progress_status = ctk.CTkLabel(
+            self.visual_progress_frame,
+            text="Ready to analyze...",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        )
+        self.visual_progress_status.pack(pady=(0, 10))
+
+        # Spinner animation label (for visual feedback)
+        self.visual_spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.visual_spinner_idx = 0
+        self.visual_spinner_active = False
+
+        # Results scroll (for thumbnail grid)
         self.visual_results_scroll = ctk.CTkScrollableFrame(
             results_frame,
             fg_color=COLORS["progress_bg"]
         )
         self.visual_results_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+
+        # Store scene analysis results
+        self.visual_scene_result = None
+        self.visual_thumbnail_refs = []  # Keep references to prevent garbage collection
+
+    def _update_visual_progress(self, progress):
+        """Update progress indicators during scene analysis"""
+        if not hasattr(progress, 'step_number'):
+            return
+
+        # Update step indicators
+        for i, (indicator, label) in enumerate(self.visual_step_labels):
+            if i + 1 < progress.step_number:
+                # Completed step - green
+                indicator.configure(fg_color="#2ECC71", text_color="white")
+            elif i + 1 == progress.step_number:
+                # Current step - accent color with spinner
+                spinner = self.visual_spinner_chars[self.visual_spinner_idx % len(self.visual_spinner_chars)]
+                indicator.configure(fg_color=COLORS["accent"], text_color="white")
+                self.visual_spinner_idx += 1
+            else:
+                # Future step - grey
+                indicator.configure(fg_color=COLORS["card_hover"], text_color=COLORS["text"])
+
+        # Update progress bar
+        overall_progress = ((progress.step_number - 1) / progress.total_steps) + (progress.progress / 100 / progress.total_steps)
+        self.visual_progress_bar.set(overall_progress)
+
+        # Update status text with spinner
+        spinner = self.visual_spinner_chars[self.visual_spinner_idx % len(self.visual_spinner_chars)]
+        self.visual_progress_status.configure(text=f"{spinner} {progress.message} {progress.detail}")
+
+        self.update_idletasks()
+
+    def _visual_show_thumbnails(self, result):
+        """Display thumbnail grid for user preview and selection"""
+        # Clear old results
+        for widget in self.visual_results_scroll.winfo_children():
+            widget.destroy()
+        self.visual_thumbnail_refs = []
+        self.visual_clip_vars = {}
+
+        if not result or not result.candidates:
+            ctk.CTkLabel(
+                self.visual_results_scroll,
+                text="No comedy scenes detected in this video.",
+                font=("Arial", 14),
+                text_color="#FFB347"
+            ).pack(pady=20)
+            return
+
+        # Header with stats
+        stats_text = f"Found {len(result.candidates)} unique scenes (from {result.total_scenes} total, {result.total_scenes - result.unique_scenes} duplicates removed)"
+        ctk.CTkLabel(
+            self.visual_results_scroll,
+            text=stats_text,
+            font=("Arial", 12, "bold"),
+            text_color=COLORS["accent"]
+        ).pack(pady=(10, 15), anchor="w")
+
+        # Create thumbnail grid (4 columns)
+        grid_frame = ctk.CTkFrame(self.visual_results_scroll, fg_color="transparent")
+        grid_frame.pack(fill="both", expand=True)
+
+        for i, candidate in enumerate(result.candidates):
+            col = i % 4
+            row = i // 4
+
+            # Card for each scene
+            card = ctk.CTkFrame(grid_frame, fg_color=COLORS["card_bg"], corner_radius=8)
+            card.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+
+            # Thumbnail image
+            thumb_label = ctk.CTkLabel(card, text="", width=180, height=100)
+            thumb_label.pack(padx=5, pady=5)
+
+            if candidate.thumbnail_path and os.path.exists(candidate.thumbnail_path):
+                try:
+                    img = Image.open(candidate.thumbnail_path)
+                    img = img.resize((180, 100), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    thumb_label.configure(image=photo)
+                    self.visual_thumbnail_refs.append(photo)  # Keep reference
+                except Exception as e:
+                    thumb_label.configure(text="[No Preview]", fg_color=COLORS["card_hover"])
+            else:
+                thumb_label.configure(text="[No Preview]", fg_color=COLORS["card_hover"])
+
+            # Time range
+            ctk.CTkLabel(
+                card,
+                text=f"{candidate.start_str} - {candidate.end_str} ({candidate.duration:.1f}s)",
+                font=("Courier New", 10),
+                text_color=COLORS["accent"]
+            ).pack()
+
+            # Action label with confidence
+            conf_pct = candidate.confidence * 100
+            ctk.CTkLabel(
+                card,
+                text=f"{candidate.action_label}",
+                font=("Arial", 11, "bold"),
+                text_color="#90EE90"
+            ).pack()
+
+            ctk.CTkLabel(
+                card,
+                text=f"{conf_pct:.0f}% confidence",
+                font=("Arial", 9),
+                text_color=COLORS["text"]
+            ).pack()
+
+            # Checkbox for selection
+            var = ctk.BooleanVar(value=True)
+            cb = ctk.CTkCheckBox(
+                card,
+                text="Include",
+                variable=var,
+                font=("Arial", 10),
+                fg_color=COLORS["accent"]
+            )
+            cb.pack(pady=5)
+
+            self.visual_clip_vars[i] = {
+                "var": var,
+                "candidate": candidate
+            }
+
+            # Preview button
+            preview_btn = ctk.CTkButton(
+                card,
+                text="▶ Preview",
+                command=lambda c=candidate, r=result: self._visual_preview_clip(c, r),
+                fg_color=COLORS["card_hover"],
+                hover_color=COLORS["accent_hover"],
+                font=("Arial", 10),
+                width=80,
+                height=25
+            )
+            preview_btn.pack(pady=(0, 5))
+
+        # Configure grid columns to expand
+        for col in range(4):
+            grid_frame.columnconfigure(col, weight=1)
+
+    def _visual_preview_clip(self, candidate, result):
+        """Preview a clip using VLC or external player"""
+        if not result.video_path or not os.path.exists(result.video_path):
+            messagebox.showerror("Error", "Video file not found for preview")
+            return
+
+        # Use ffplay for quick preview (comes with ffmpeg)
+        cmd = [
+            "ffplay",
+            "-ss", str(candidate.start_time),
+            "-t", str(candidate.duration),
+            "-autoexit",
+            "-window_title", f"Preview: {candidate.action_label}",
+            result.video_path
+        ]
+
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            # Fallback to VLC if available
+            if VLC_AVAILABLE:
+                messagebox.showinfo("Preview", f"Preview clip from {candidate.start_str} to {candidate.end_str}")
+            else:
+                messagebox.showwarning("Preview", "ffplay not found. Install ffmpeg for preview functionality.")
+
+    def _visual_scene_analyze_all(self, videos):
+        """Scene-based analysis for one or more videos with progress UI"""
+        print(f"[DEBUG] _visual_scene_analyze_all called with {len(videos)} videos")
+
+        if not SCENE_ANALYSIS_AVAILABLE:
+            messagebox.showerror("Error", "Scene analysis module not available")
+            return
+
+        try:
+            print(f"[DEBUG] Showing progress frame...")
+            # Show progress section - unpack results first, pack progress, then repack results
+            self.visual_results_scroll.pack_forget()
+            self.visual_progress_frame.pack(fill="x", padx=15, pady=(0, 10))
+            self.visual_results_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+            print(f"[DEBUG] Progress frame shown")
+
+            # Clear old results
+            for widget in self.visual_results_scroll.winfo_children():
+                widget.destroy()
+            self.visual_clip_vars = {}
+            self.visual_scene_results = []  # Store all results
+
+            # Reset progress
+            self.visual_progress_bar.set(0)
+            for indicator, label in self.visual_step_labels:
+                indicator.configure(fg_color=COLORS["card_hover"], text_color=COLORS["text"])
+
+            self.visual_analyze_btn.configure(state="disabled", text="Analyzing...")
+            self.visual_status_label.configure(text=f"Analyzing {len(videos)} video(s) with scene detection...")
+            self.visual_spinner_active = True
+            self.update()
+
+            # Get settings
+            try:
+                min_confidence = float(self.visual_min_confidence.get().strip() or "15") / 100.0
+            except ValueError:
+                min_confidence = 0.15
+
+            def analyze_thread():
+                all_results = []
+                total_videos = len(videos)
+
+                for video_idx, video in enumerate(videos):
+                    # Update status for current video
+                    self.after(0, lambda idx=video_idx, v=video: self.visual_status_label.configure(
+                        text=f"Video {idx+1}/{total_videos}: {v['title'][:40]}..."
+                    ))
+
+                    def progress_callback(p):
+                        # Adjust progress to account for multiple videos
+                        # Each video's 6 steps contribute to overall progress
+                        video_progress = (video_idx / total_videos) + (p.step_number / p.total_steps / total_videos)
+                        adjusted_progress = AnalysisProgress(
+                            step=p.step,
+                            step_number=p.step_number,
+                            total_steps=p.total_steps,
+                            progress=p.progress,
+                            message=f"[{video_idx+1}/{total_videos}] {p.message}",
+                            detail=p.detail
+                        )
+                        self.after(0, lambda: self._update_visual_progress(adjusted_progress))
+
+                    try:
+                        print(f"[SCENE] Analyzing video {video_idx+1}/{total_videos}: {video['title'][:50]}")
+                        result = analyze_video_scenes(
+                            video["url"],
+                            video["title"],
+                            min_confidence=min_confidence,
+                            progress_callback=progress_callback
+                        )
+
+                        if result and result.candidates:
+                            all_results.append({
+                                "video": video,
+                                "result": result
+                            })
+                            print(f"[SCENE] Found {len(result.candidates)} candidates in {video['title'][:30]}")
+                        else:
+                            print(f"[SCENE] No candidates found in {video['title'][:30]}")
+
+                    except Exception as e:
+                        print(f"[SCENE] Error analyzing {video['title']}: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                # Store combined results and update UI
+                self.after(0, lambda: self._visual_scene_analysis_complete(all_results))
+
+            print(f"[DEBUG] Starting analyze thread...")
+            threading.Thread(target=analyze_thread, daemon=True).start()
+            print(f"[DEBUG] Analyze thread started")
+
+        except Exception as e:
+            print(f"[ERROR] Exception in _visual_scene_analyze_all: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Scene analysis failed:\n{e}")
+
+    def _visual_scene_analysis_complete(self, all_results):
+        """Called when scene analysis of all videos is complete"""
+        self.visual_spinner_active = False
+        self.visual_analyze_btn.configure(state="normal", text="👁️ Analyze Selected Videos")
+
+        # Store results
+        self.visual_scene_results = all_results
+
+        # Calculate totals
+        total_candidates = sum(len(r["result"].candidates) for r in all_results)
+        total_scenes = sum(r["result"].total_scenes for r in all_results)
+        total_unique = sum(r["result"].unique_scenes for r in all_results)
+        total_time = sum(r["result"].analysis_time for r in all_results)
+
+        # Update final progress
+        self.visual_progress_bar.set(1.0)
+        self.visual_progress_status.configure(
+            text=f"✓ Complete! Found {total_candidates} scenes ({total_scenes - total_unique} duplicates removed) in {total_time:.1f}s"
+        )
+
+        # Mark all steps complete
+        for indicator, label in self.visual_step_labels:
+            indicator.configure(fg_color="#2ECC71", text_color="white")
+
+        # Show combined thumbnail grid
+        self._visual_show_all_thumbnails(all_results)
+
+        # Update status
+        self.visual_status_label.configure(
+            text=f"Found {total_candidates} clip candidates in {len(all_results)} video(s) - select and download below"
+        )
+
+    def _visual_show_all_thumbnails(self, all_results):
+        """Display thumbnail grid for all analyzed videos"""
+        # Clear old results
+        for widget in self.visual_results_scroll.winfo_children():
+            widget.destroy()
+        self.visual_thumbnail_refs = []
+        self.visual_clip_vars = {}
+
+        if not all_results:
+            ctk.CTkLabel(
+                self.visual_results_scroll,
+                text="No comedy scenes detected in the selected videos.",
+                font=("Arial", 14),
+                text_color="#FFB347"
+            ).pack(pady=20)
+            return
+
+        clip_id = 0
+        for result_data in all_results:
+            video = result_data["video"]
+            result = result_data["result"]
+
+            if not result.candidates:
+                continue
+
+            # Video header
+            video_header = ctk.CTkFrame(self.visual_results_scroll, fg_color=COLORS["card_bg"], corner_radius=8)
+            video_header.pack(fill="x", pady=(10, 5), padx=5)
+
+            title_text = video["title"][:60] + ("..." if len(video["title"]) > 60 else "")
+            stats_text = f"🎬 {title_text} - {len(result.candidates)} scenes ({result.total_scenes - result.unique_scenes} duplicates removed)"
+            ctk.CTkLabel(
+                video_header,
+                text=stats_text,
+                font=("Arial", 12, "bold"),
+                text_color=COLORS["accent"]
+            ).pack(pady=8, padx=10, anchor="w")
+
+            # Create thumbnail grid (4 columns)
+            grid_frame = ctk.CTkFrame(self.visual_results_scroll, fg_color="transparent")
+            grid_frame.pack(fill="both", expand=True, padx=5)
+
+            for i, candidate in enumerate(result.candidates):
+                col = i % 4
+                row = i // 4
+
+                # Card for each scene
+                card = ctk.CTkFrame(grid_frame, fg_color=COLORS["card_bg"], corner_radius=8)
+                card.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+
+                # Thumbnail image
+                thumb_label = ctk.CTkLabel(card, text="", width=180, height=100)
+                thumb_label.pack(padx=5, pady=5)
+
+                if candidate.thumbnail_path and os.path.exists(candidate.thumbnail_path):
+                    try:
+                        img = Image.open(candidate.thumbnail_path)
+                        img = img.resize((180, 100), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        thumb_label.configure(image=photo)
+                        self.visual_thumbnail_refs.append(photo)  # Keep reference
+                    except Exception as e:
+                        thumb_label.configure(text="[No Preview]", fg_color=COLORS["card_hover"])
+                else:
+                    thumb_label.configure(text="[No Preview]", fg_color=COLORS["card_hover"])
+
+                # Time range
+                ctk.CTkLabel(
+                    card,
+                    text=f"{candidate.start_str} - {candidate.end_str} ({candidate.duration:.1f}s)",
+                    font=("Courier New", 10),
+                    text_color=COLORS["accent"]
+                ).pack()
+
+                # Action label with confidence
+                conf_pct = candidate.confidence * 100
+                ctk.CTkLabel(
+                    card,
+                    text=f"{candidate.action_label}",
+                    font=("Arial", 11, "bold"),
+                    text_color="#90EE90"
+                ).pack()
+
+                ctk.CTkLabel(
+                    card,
+                    text=f"{conf_pct:.0f}% confidence",
+                    font=("Arial", 9),
+                    text_color=COLORS["text"]
+                ).pack()
+
+                # Checkbox for selection
+                var = ctk.BooleanVar(value=True)
+                cb = ctk.CTkCheckBox(
+                    card,
+                    text="Include",
+                    variable=var,
+                    font=("Arial", 10),
+                    fg_color=COLORS["accent"]
+                )
+                cb.pack(pady=5)
+
+                self.visual_clip_vars[clip_id] = {
+                    "var": var,
+                    "candidate": candidate,
+                    "result": result,
+                    "video": video
+                }
+                clip_id += 1
+
+                # Preview button
+                preview_btn = ctk.CTkButton(
+                    card,
+                    text="▶ Preview",
+                    command=lambda c=candidate, r=result: self._visual_preview_clip(c, r),
+                    fg_color=COLORS["card_hover"],
+                    hover_color=COLORS["accent_hover"],
+                    font=("Arial", 10),
+                    width=80,
+                    height=25
+                )
+                preview_btn.pack(pady=(0, 5))
+
+            # Configure grid columns to expand
+            for col in range(4):
+                grid_frame.columnconfigure(col, weight=1)
+
+    def _visual_scene_analyze(self, video):
+        """New scene-based analysis for a single video (legacy, redirects to _visual_scene_analyze_all)"""
+        self._visual_scene_analyze_all([video])
+
+    def _visual_analysis_complete(self, result):
+        """Called when scene analysis is complete"""
+        self.visual_spinner_active = False
+        self.visual_analyze_btn.configure(state="normal", text="👁️ Analyze Selected Videos")
+
+        if result:
+            # Update final progress
+            self.visual_progress_bar.set(1.0)
+            self.visual_progress_status.configure(
+                text=f"✓ Complete! Found {len(result.candidates)} scenes in {result.analysis_time:.1f}s"
+            )
+
+            # Mark all steps complete
+            for indicator, label in self.visual_step_labels:
+                indicator.configure(fg_color="#2ECC71", text_color="white")
+
+            # Show thumbnail grid
+            self._visual_show_thumbnails(result)
+
+            # Update status
+            self.visual_status_label.configure(
+                text=f"Found {len(result.candidates)} clip candidates - select and download below"
+            )
+        else:
+            self.visual_progress_status.configure(text="✗ Analysis failed")
+
+    def _visual_analysis_error(self, error_msg):
+        """Called when scene analysis fails"""
+        self.visual_spinner_active = False
+        self.visual_analyze_btn.configure(state="normal", text="👁️ Analyze Selected Videos")
+        self.visual_progress_status.configure(text=f"✗ Error: {error_msg}")
+        messagebox.showerror("Analysis Error", f"Failed to analyze video:\n{error_msg}")
 
     def _visual_search(self):
         """Search YouTube for videos"""
@@ -2760,10 +3300,15 @@ class QuickTubeApp(ctk.CTk):
             var = ctk.BooleanVar(value=True)
             self.visual_video_vars[i] = var
 
-            # Check if processed
-            from visual_analysis import get_video_hash
-            video_hash = get_video_hash(video["url"])
-            is_processed = video_hash in db["videos"]
+            # Check if processed (only if visual_analysis available)
+            is_processed = False
+            if VISUAL_ANALYSIS_AVAILABLE:
+                try:
+                    from visual_analysis import get_video_hash
+                    video_hash = get_video_hash(video["url"])
+                    is_processed = video_hash in db["videos"]
+                except:
+                    pass
 
             cb = ctk.CTkCheckBox(row, text="", variable=var, width=24)
             cb.pack(side="left", padx=5)
@@ -2829,30 +3374,62 @@ class QuickTubeApp(ctk.CTk):
         return action_keywords
 
     def _visual_analyze(self):
-        """Analyze selected videos"""
-        if not VISUAL_ANALYSIS_AVAILABLE:
-            messagebox.showerror("Error", "Visual analysis module not available")
-            return
+        """Analyze selected videos - uses scene-based analysis with deduplication"""
+        try:
+            print(f"[DEBUG] _visual_analyze() called")
 
-        # Get selected videos
-        selected = []
-        for i, var in self.visual_video_vars.items():
-            if var.get() and i < len(self.visual_videos):
-                selected.append(self.visual_videos[i])
+            # Check if any analysis method is available
+            if not VISUAL_ANALYSIS_AVAILABLE and not SCENE_ANALYSIS_AVAILABLE:
+                messagebox.showerror("Error", "No visual analysis module available.\nPlease check that visual_analysis.py or scene_analysis.py exists.")
+                return
 
-        # Also check local file
-        local_file = self.visual_file_entry.get().strip()
-        if local_file and os.path.exists(local_file):
-            selected.append({
-                "url": local_file,
-                "title": os.path.basename(local_file),
-                "id": "local"
-            })
+            # Get selected videos
+            selected = []
+            print(f"[DEBUG] visual_video_vars: {len(self.visual_video_vars)} items")
+            print(f"[DEBUG] visual_videos: {len(self.visual_videos)} items")
 
-        if not selected:
-            messagebox.showwarning("No Videos", "Please select videos to analyze or enter a local file path")
-            return
+            for i, var in self.visual_video_vars.items():
+                if var.get() and i < len(self.visual_videos):
+                    selected.append(self.visual_videos[i])
+                    print(f"[DEBUG] Selected video {i}: {self.visual_videos[i].get('title', 'Unknown')[:30]}")
 
+            # Also check local file
+            local_file = self.visual_file_entry.get().strip()
+            if local_file and os.path.exists(local_file):
+                selected.append({
+                    "url": local_file,
+                    "title": os.path.basename(local_file),
+                    "id": "local"
+                })
+                print(f"[DEBUG] Added local file: {local_file}")
+
+            if not selected:
+                print(f"[DEBUG] No videos selected!")
+                messagebox.showwarning("No Videos", "Please select videos to analyze or enter a local file path")
+                return
+
+            print(f"[DEBUG] Total selected: {len(selected)} video(s)")
+            print(f"[DEBUG] SCENE_ANALYSIS_AVAILABLE = {SCENE_ANALYSIS_AVAILABLE}")
+            print(f"[DEBUG] VISUAL_ANALYSIS_AVAILABLE = {VISUAL_ANALYSIS_AVAILABLE}")
+
+            # Always use new scene-based analysis if available (better deduplication, progress UI)
+            if SCENE_ANALYSIS_AVAILABLE:
+                print(f"[DEBUG] Calling _visual_scene_analyze_all...")
+                self._visual_scene_analyze_all(selected)
+                return
+
+            # Fallback to original method if scene analysis not available
+            print(f"[DEBUG] Falling back to _visual_analyze_batch...")
+            self._visual_analyze_batch(selected)
+
+        except Exception as e:
+            print(f"[ERROR] Exception in _visual_analyze: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Analysis failed:\n{e}")
+
+    def _visual_analyze_batch(self, selected):
+        """Original batch analysis for multiple videos"""
         self.visual_analyze_btn.configure(state="disabled", text="Analyzing...")
         self.visual_status_label.configure(text=f"Analyzing {len(selected)} video(s)...")
         self.update()
@@ -2887,7 +3464,7 @@ class QuickTubeApp(ctk.CTk):
         def analyze_thread():
             all_results = []
             total = len(selected)
-            print(f"[UI-VISUAL] Starting analysis of {total} video(s)")
+            print(f"[UI-VISUAL] Starting batch analysis of {total} video(s)")
             print(f"[UI-VISUAL] Model: {model}")
             print(f"[UI-VISUAL] Action keywords: {action_keywords}")
             print(f"[UI-VISUAL] Min clip duration: {min_duration}s")
@@ -2924,7 +3501,7 @@ class QuickTubeApp(ctk.CTk):
                     import traceback
                     traceback.print_exc()
 
-            print(f"[UI-VISUAL] Analysis complete. Total results: {len(all_results)}")
+            print(f"[UI-VISUAL] Batch analysis complete. Total results: {len(all_results)}")
 
             self.after(0, lambda: self._visual_display_results(all_results))
 
@@ -3039,7 +3616,19 @@ class QuickTubeApp(ctk.CTk):
             data["var"].set(False)
 
     def _visual_download_clips(self):
-        """Download selected clips"""
+        """Download selected clips - handles both scene-based and batch analysis"""
+
+        # Check if we have scene-based analysis results (new workflow with thumbnails)
+        if hasattr(self, 'visual_scene_results') and self.visual_scene_results:
+            self._visual_download_scene_clips()
+            return
+
+        # Also check single result (backwards compatibility)
+        if hasattr(self, 'visual_scene_result') and self.visual_scene_result:
+            self._visual_download_scene_clips()
+            return
+
+        # Original batch download for old analysis method
         selected = []
         for clip_id, data in self.visual_clip_vars.items():
             if data["var"].get():
@@ -3139,6 +3728,86 @@ class QuickTubeApp(ctk.CTk):
             self.after(0, lambda: self._visual_download_complete(output_folder, len(selected)))
 
         threading.Thread(target=download_thread, daemon=True).start()
+
+    def _visual_download_scene_clips(self):
+        """Download clips from scene-based analysis (new workflow with thumbnails)"""
+        # Collect selected clips from the new format
+        selected_clips = []
+        for clip_id, data in self.visual_clip_vars.items():
+            if data["var"].get() and "candidate" in data and "result" in data:
+                selected_clips.append(data)
+
+        if not selected_clips:
+            messagebox.showwarning("No Clips", "Please select clips to download")
+            return
+
+        confirm = messagebox.askyesno(
+            "Download Clips",
+            f"Download {len(selected_clips)} clip(s) to visual_clips folder?"
+        )
+
+        if not confirm:
+            return
+
+        self.visual_download_btn.configure(state="disabled", text="Saving...")
+        self.visual_status_label.configure(text="Saving selected clips...")
+        self.update()
+
+        def save_thread():
+            output_folder = os.path.join(DOWNLOAD_FOLDER, "visual_clips")
+            os.makedirs(output_folder, exist_ok=True)
+            saved_count = 0
+
+            try:
+                total = len(selected_clips)
+                for i, data in enumerate(selected_clips):
+                    candidate = data["candidate"]
+                    result = data["result"]
+                    video = data.get("video", {})
+
+                    self.after(0, lambda i=i, c=candidate: self.visual_status_label.configure(
+                        text=f"Saving clip {i+1}/{total}: {c.action_label}..."
+                    ))
+
+                    # Create filename
+                    safe_title = "".join(c for c in result.video_title[:30] if c.isalnum() or c in " -_").strip()
+                    safe_action = candidate.action_label.replace(" ", "_").replace("/", "-")[:20]
+                    filename = f"{safe_title}_{candidate.start_str.replace(':', '-')}_{safe_action}.mp4"
+                    output_path = os.path.join(output_folder, filename)
+
+                    # Extract clip using ffmpeg
+                    if result.video_path and os.path.exists(result.video_path):
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-ss", str(candidate.start_time),
+                            "-i", result.video_path,
+                            "-t", str(candidate.duration),
+                            "-c", "copy",
+                            output_path
+                        ]
+
+                        try:
+                            subprocess.run(cmd, capture_output=True, timeout=60)
+                            if os.path.exists(output_path):
+                                saved_count += 1
+                                print(f"[SCENE] Saved: {filename}")
+                            else:
+                                print(f"[SCENE] Failed to save: {filename}")
+                        except Exception as e:
+                            print(f"[SCENE] Error saving {filename}: {e}")
+                    else:
+                        print(f"[SCENE] Video file not found: {result.video_path}")
+
+                self.after(0, lambda: self._visual_download_complete(output_folder, saved_count))
+
+            except Exception as e:
+                print(f"[VISUAL] Error saving clips: {e}")
+                import traceback
+                traceback.print_exc()
+                self.after(0, lambda: messagebox.showerror("Error", f"Failed to save clips: {e}"))
+                self.after(0, lambda: self.visual_download_btn.configure(state="normal", text="📥 Download Selected Clips"))
+
+        threading.Thread(target=save_thread, daemon=True).start()
 
     def _visual_download_complete(self, output_folder, count):
         """Handle download completion"""
