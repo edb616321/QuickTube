@@ -62,6 +62,35 @@ except ImportError:
     CODEC_UTILS_AVAILABLE = False
     print("[QuickTube] Warning: codec_utils not available, codec detection disabled")
 
+# Import audio impact detection utilities
+try:
+    from audio_detection import (
+        analyze_video, analyze_youtube_video, extract_audio,
+        detect_impacts, format_results as format_audio_results,
+        ImpactEvent, AudioAnalysisResult, seconds_to_timestamp
+    )
+    AUDIO_DETECTION_AVAILABLE = True
+except ImportError:
+    AUDIO_DETECTION_AVAILABLE = False
+    print("[QuickTube] Warning: audio_detection not available")
+
+# Import visual analysis utilities
+try:
+    from visual_analysis import (
+        analyze_video as visual_analyze_video,
+        search_youtube as visual_search_youtube,
+        get_benny_hill_videos,
+        is_video_processed,
+        load_processed_database,
+        format_results as format_visual_results,
+        VideoAnalysisResult,
+        PHYSICAL_COMEDY_CLASSES
+    )
+    VISUAL_ANALYSIS_AVAILABLE = True
+except ImportError:
+    VISUAL_ANALYSIS_AVAILABLE = False
+    print("[QuickTube] Warning: visual_analysis not available")
+
 # Constants
 DOWNLOAD_FOLDER = r"D:\stacher_downloads"
 TEMP_FOLDER = r"D:\QuickTube\temp"
@@ -70,6 +99,69 @@ SETTINGS_FILE = "settings.json"
 HISTORY_FILE = "download_history.json"
 POT_SERVER_PATH = r"D:\QuickTube\pot-provider\server"
 POT_SERVER_PORT = 4416
+LOCK_FILE = os.path.join(TEMP_FOLDER, "quicktube.lock")
+
+
+def check_single_instance():
+    """Check if another instance of QuickTube is already running.
+
+    Returns:
+        tuple: (is_running, pid) - is_running is True if another instance exists
+    """
+    os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+
+            # Check if process with that PID is still running
+            import psutil
+            if psutil.pid_exists(old_pid):
+                try:
+                    proc = psutil.Process(old_pid)
+                    # Verify it's actually QuickTube (check if python is running quicktube)
+                    cmdline = ' '.join(proc.cmdline()).lower()
+                    if 'quicktube' in cmdline or 'python' in proc.name().lower():
+                        return True, old_pid
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except (ValueError, FileNotFoundError):
+            pass
+
+    # No other instance running - create lock file with our PID
+    with open(LOCK_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+    return False, None
+
+
+def kill_existing_instance(pid):
+    """Kill an existing QuickTube instance by PID"""
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        proc.terminate()
+        proc.wait(timeout=5)
+        print(f"[QuickTube] Terminated existing instance (PID: {pid})")
+
+        # Remove stale lock file
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+        return True
+    except Exception as e:
+        print(f"[QuickTube] Could not terminate process: {e}")
+        return False
+
+
+def remove_lock_file():
+    """Remove the lock file on exit"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except:
+        pass
+
 
 # Setup logging system
 def setup_logging():
@@ -207,38 +299,74 @@ class QuickTubeApp(ctk.CTk):
             print(f"[QuickTube] Warning: Could not start POT server: {e}")
 
     def _auto_login_if_needed(self):
-        """Automatically login to YouTube on startup if not authenticated"""
-        logger.info("[AUTO-LOGIN] Checking authentication status...")
+        """Automatically check and refresh YouTube authentication on startup
 
-        # Check if we have valid auth cookies in the default location
+        Process:
+        0. Quick test - if yt-dlp works with Firefox cookies, we're done
+        1. Refresh Firefox cookies to file
+        2. Check if cookies exist and have auth cookies
+        3. Check if cookies are expired
+        4. Test if cookies actually work with yt-dlp
+        5. Only skip login if ALL checks pass
+        """
+        logger.info("[AUTO-LOGIN] ========== STARTUP AUTH CHECK ==========")
+
+        # FAST PATH: Quick test if yt-dlp already works with Firefox browser cookies
+        logger.info("[AUTO-LOGIN] Quick test: checking if yt-dlp works with Firefox...")
+        if self._quick_ytdlp_test():
+            logger.info("[AUTO-LOGIN] Quick test passed - Firefox auth is valid!")
+            logger.info("[AUTO-LOGIN] ==========================================")
+            return
+
+        logger.info("[AUTO-LOGIN] Quick test failed - refreshing cookies...")
         cookies_file = os.path.join(TEMP_FOLDER, "youtube_cookies.txt")
-        has_auth = False
 
+        # STEP 1: Refresh Firefox cookies to file
+        logger.info("[AUTO-LOGIN] Step 1: Refreshing cookies from Firefox...")
+        self._refresh_firefox_cookies()
+
+        # STEP 2: Check if cookies file exists and has auth cookies
+        logger.info("[AUTO-LOGIN] Step 2: Checking for auth cookies...")
+        has_auth = False
         if os.path.exists(cookies_file):
             try:
                 with open(cookies_file, 'r') as f:
                     content = f.read()
                     auth_cookies = ['LOGIN_INFO', 'SID', 'HSID', 'SSID', '__Secure-1PSID', 'SAPISID']
-                    has_auth = any(cookie in content for cookie in auth_cookies)
+                    found_cookies = [c for c in auth_cookies if c in content]
+                    has_auth = len(found_cookies) >= 3  # Need at least 3 auth cookies
                     if has_auth:
-                        logger.info(f"[AUTO-LOGIN] Found auth cookies in {cookies_file}")
-            except:
-                pass
+                        logger.info(f"[AUTO-LOGIN] Found auth cookies: {found_cookies}")
+                    else:
+                        logger.warning(f"[AUTO-LOGIN] Insufficient auth cookies found: {found_cookies}")
+            except Exception as e:
+                logger.error(f"[AUTO-LOGIN] Error reading cookies: {e}")
+        else:
+            logger.warning(f"[AUTO-LOGIN] Cookies file not found: {cookies_file}")
 
-        if has_auth:
-            logger.info("[AUTO-LOGIN] Already authenticated - skipping login")
+        if not has_auth:
+            logger.info("[AUTO-LOGIN] No valid auth cookies - performing login...")
+            self._perform_auto_login()
             return
 
-        logger.info("[AUTO-LOGIN] Not authenticated - performing automatic login...")
+        # STEP 3: Check if cookies are expired
+        logger.info("[AUTO-LOGIN] Step 3: Checking cookie expiry...")
+        cookies_expired = self._check_cookies_expired(cookies_file)
+        if cookies_expired:
+            logger.warning("[AUTO-LOGIN] Cookies are expired - performing login...")
+            self._perform_auto_login()
+            return
 
-        # Run undetected-chromedriver login automatically (no prompts)
-        if UC_AVAILABLE:
-            try:
-                self._uc_youtube_login()
-            except Exception as e:
-                logger.error(f"[AUTO-LOGIN] Failed: {e}")
-        else:
-            logger.warning("[AUTO-LOGIN] undetected-chromedriver not available - manual login required")
+        # STEP 4: Test if cookies actually work with yt-dlp
+        logger.info("[AUTO-LOGIN] Step 4: Testing if cookies work...")
+        cookies_work = self._test_cookies_work(cookies_file)
+        if not cookies_work:
+            logger.warning("[AUTO-LOGIN] Cookies test failed - performing login...")
+            self._perform_auto_login()
+            return
+
+        logger.info("[AUTO-LOGIN] All checks passed - authentication valid!")
+        logger.info("[AUTO-LOGIN] ==========================================")
 
     def _slow_type(self, element, text, delay=0.08):
         """Type text slowly like a human to avoid bot detection"""
@@ -256,16 +384,19 @@ class QuickTubeApp(ctk.CTk):
 
         logger.info(f"[UC-LOGIN] Starting login for {email}")
 
-        # Create undetected Chrome instance
+        # Create undetected Chrome instance - HEADLESS mode
         options = uc.ChromeOptions()
-        options.add_argument("--start-maximized")
+        options.add_argument("--headless=new")  # Run in background
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--window-size=1920,1080")
 
         # Use a persistent user data directory
         user_data_dir = os.path.join(os.path.dirname(__file__), "chrome_profile")
         os.makedirs(user_data_dir, exist_ok=True)
         options.add_argument(f"--user-data-dir={user_data_dir}")
 
-        driver = uc.Chrome(options=options, version_main=None)
+        driver = uc.Chrome(options=options, headless=True, version_main=None)
         wait = WebDriverWait(driver, 20)
 
         try:
@@ -802,6 +933,133 @@ class QuickTubeApp(ctk.CTk):
         except Exception as e:
             print(f"[QuickTube] Cookie refresh failed: {e}")
 
+    def _check_cookies_expired(self, cookies_file: str) -> bool:
+        """Check if the authentication cookies are expired
+
+        Returns True if expired, False if still valid
+        """
+        try:
+            import time
+            current_time = int(time.time())
+
+            with open(cookies_file, 'r') as f:
+                for line in f:
+                    if line.startswith('#') or not line.strip():
+                        continue
+
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 7:
+                        cookie_name = parts[5]
+                        expiry_str = parts[4]
+
+                        # Check auth cookies for expiry
+                        auth_cookies = ['LOGIN_INFO', 'SID', 'HSID', 'SSID', '__Secure-1PSID', 'SAPISID']
+                        if cookie_name in auth_cookies:
+                            try:
+                                expiry = int(expiry_str)
+                                if expiry > 0 and expiry < current_time:
+                                    logger.warning(f"[AUTO-LOGIN] Cookie {cookie_name} expired at {expiry} (now: {current_time})")
+                                    return True
+                            except ValueError:
+                                pass
+
+            logger.info("[AUTO-LOGIN] Auth cookies are not expired")
+            return False
+
+        except Exception as e:
+            logger.error(f"[AUTO-LOGIN] Error checking expiry: {e}")
+            return True  # Assume expired on error
+
+    def _test_cookies_work(self, cookies_file: str) -> bool:
+        """Test if cookies actually work by doing a quick yt-dlp check
+
+        Returns True if authentication works, False otherwise
+        """
+        try:
+            logger.info("[AUTO-LOGIN] Running yt-dlp auth test...")
+
+            # Quick test: try to get info from a video
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--cookies", cookies_file,
+                    "--skip-download",
+                    "--quiet",
+                    "--no-warnings",
+                    "--print", "title",
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            # Check for bot detection or auth errors
+            stderr = result.stderr.lower() if result.stderr else ""
+            if "sign in" in stderr or "bot" in stderr or "confirm your age" in stderr:
+                logger.warning(f"[AUTO-LOGIN] yt-dlp detected auth issue: {result.stderr[:200]}")
+                return False
+
+            if result.returncode == 0:
+                logger.info("[AUTO-LOGIN] yt-dlp test passed - video title retrieved")
+                return True
+            else:
+                logger.warning(f"[AUTO-LOGIN] yt-dlp test failed with code {result.returncode}")
+                if "sign in" in stderr or "bot" in stderr:
+                    return False
+                logger.info("[AUTO-LOGIN] Non-auth error - assuming cookies are valid")
+                return True
+
+        except subprocess.TimeoutExpired:
+            logger.warning("[AUTO-LOGIN] yt-dlp test timed out")
+            return True  # Network issue, not auth issue
+        except Exception as e:
+            logger.error(f"[AUTO-LOGIN] yt-dlp test error: {e}")
+            return True  # Assume valid on other errors
+
+    def _quick_ytdlp_test(self) -> bool:
+        """Quick test if yt-dlp works with Firefox browser cookies directly
+
+        Returns True if auth works, False otherwise
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--cookies-from-browser", "firefox",
+                    "--skip-download",
+                    "--quiet",
+                    "--no-warnings",
+                    "--print", "title",
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+
+            stderr = result.stderr.lower() if result.stderr else ""
+            if "sign in" in stderr or "bot" in stderr:
+                return False
+
+            return result.returncode == 0
+
+        except:
+            return False
+
+    def _perform_auto_login(self):
+        """Perform automatic login using available methods"""
+        if UC_AVAILABLE:
+            try:
+                logger.info("[AUTO-LOGIN] Using undetected-chromedriver for login...")
+                self._uc_youtube_login()
+            except Exception as e:
+                logger.error(f"[AUTO-LOGIN] UC login failed: {e}")
+                logger.warning("[AUTO-LOGIN] Please try logging into YouTube manually in Firefox")
+        else:
+            logger.warning("[AUTO-LOGIN] No automated login method available")
+            logger.info("[AUTO-LOGIN] Please login to YouTube in Firefox, then restart QuickTube")
+
     def _get_cookie_args(self) -> list:
         """Get the appropriate cookie arguments for yt-dlp
 
@@ -934,6 +1192,30 @@ class QuickTubeApp(ctk.CTk):
         )
         self.search_tab_btn.pack(side="left", padx=5)
 
+        self.audio_tab_btn = ctk.CTkButton(
+            tab_frame,
+            text="🔊 Audio Detection",
+            command=lambda: self.switch_tab("audio"),
+            fg_color=COLORS["card_bg"],
+            hover_color=COLORS["card_hover"],
+            font=("Arial", 14, "bold"),
+            width=170,
+            height=40
+        )
+        self.audio_tab_btn.pack(side="left", padx=5)
+
+        self.visual_tab_btn = ctk.CTkButton(
+            tab_frame,
+            text="👁️ Visual Analysis",
+            command=lambda: self.switch_tab("visual"),
+            fg_color=COLORS["card_bg"],
+            hover_color=COLORS["card_hover"],
+            font=("Arial", 14, "bold"),
+            width=170,
+            height=40
+        )
+        self.visual_tab_btn.pack(side="left", padx=5)
+
         # Open Folder button (always visible)
         open_folder_btn = ctk.CTkButton(
             tab_frame,
@@ -951,9 +1233,11 @@ class QuickTubeApp(ctk.CTk):
         self.tab_container = ctk.CTkFrame(self, fg_color="transparent")
         self.tab_container.pack(fill="both", expand=True, padx=20, pady=10)
 
-        # Create both tab frames
+        # Create all tab frames
         self._create_url_tab()
         self._create_search_tab()
+        self._create_audio_tab()
+        self._create_visual_tab()
 
         # Show URL tab by default
         self.current_tab = "url"
@@ -1372,8 +1656,1500 @@ class QuickTubeApp(ctk.CTk):
         )
         self.search_progress.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
+    def _create_audio_tab(self):
+        """Create the Audio Detection tab for finding impact sounds in videos"""
+        self.audio_tab_frame = ctk.CTkFrame(self.tab_container, fg_color="transparent")
+
+        # State for audio detection
+        self.audio_video_results = []
+        self.audio_video_vars = {}
+        self.audio_analysis_results = {}
+
+        # ===== SECTION 1: Video Input =====
+        input_frame = ctk.CTkFrame(self.audio_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        input_frame.pack(fill="x", pady=(10, 5))
+
+        # Title row
+        title_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        title_row.pack(fill="x", padx=20, pady=(10, 5))
+
+        title_label = ctk.CTkLabel(
+            title_row,
+            text="Step 1: Select Video",
+            font=("Arial", 16, "bold"),
+            text_color=COLORS["text"]
+        )
+        title_label.pack(side="left")
+
+        # URL input row
+        url_row = ctk.CTkFrame(input_frame, fg_color="transparent")
+        url_row.pack(fill="x", padx=20, pady=5)
+
+        self.audio_url_entry = ctk.CTkEntry(
+            url_row,
+            font=("Arial", 14),
+            placeholder_text="Paste YouTube URL here...",
+            height=40
+        )
+        self.audio_url_entry.pack(side="left", fill="x", expand=True)
+        self.audio_url_entry.bind("<Control-v>", lambda e: self.audio_url_entry.event_generate('<<Paste>>'))
+
+        # OR use local file
+        or_label = ctk.CTkLabel(url_row, text="OR", font=("Arial", 12, "bold"), text_color=COLORS["accent"])
+        or_label.pack(side="left", padx=15)
+
+        self.audio_browse_btn = ctk.CTkButton(
+            url_row,
+            text="📁 Browse Local File",
+            command=self._audio_browse_file,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent"],
+            font=("Arial", 14),
+            width=160,
+            height=40
+        )
+        self.audio_browse_btn.pack(side="left")
+
+        # Selected file label
+        self.audio_file_label = ctk.CTkLabel(
+            input_frame,
+            text="No file selected",
+            font=("Arial", 11),
+            text_color=COLORS["accent"]
+        )
+        self.audio_file_label.pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ===== SECTION 2: Detection Settings =====
+        settings_frame = ctk.CTkFrame(self.audio_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        settings_frame.pack(fill="x", pady=5)
+
+        settings_header = ctk.CTkLabel(
+            settings_frame,
+            text="Step 2: Detection Settings",
+            font=("Arial", 16, "bold"),
+            text_color=COLORS["text"]
+        )
+        settings_header.pack(anchor="w", padx=20, pady=(10, 5))
+
+        settings_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        settings_row.pack(fill="x", padx=20, pady=5)
+
+        # Sensitivity slider
+        sens_label = ctk.CTkLabel(settings_row, text="Sensitivity:", font=("Arial", 14), text_color=COLORS["text"])
+        sens_label.pack(side="left")
+
+        self.audio_sensitivity_var = ctk.DoubleVar(value=0.5)
+        self.audio_sensitivity_slider = ctk.CTkSlider(
+            settings_row,
+            from_=0.1,
+            to=0.9,
+            variable=self.audio_sensitivity_var,
+            width=200
+        )
+        self.audio_sensitivity_slider.pack(side="left", padx=(10, 5))
+
+        self.audio_sens_label = ctk.CTkLabel(settings_row, text="0.5", font=("Arial", 12), text_color=COLORS["accent"], width=40)
+        self.audio_sens_label.pack(side="left")
+        self.audio_sensitivity_slider.configure(command=self._update_sens_label)
+
+        # Min gap
+        gap_label = ctk.CTkLabel(settings_row, text="Min gap (sec):", font=("Arial", 14), text_color=COLORS["text"])
+        gap_label.pack(side="left", padx=(30, 0))
+
+        self.audio_min_gap_entry = ctk.CTkEntry(settings_row, font=("Arial", 14), width=50, height=35)
+        self.audio_min_gap_entry.insert(0, "0.5")
+        self.audio_min_gap_entry.pack(side="left", padx=(10, 0))
+
+        # Analyze button
+        self.audio_analyze_btn = ctk.CTkButton(
+            settings_row,
+            text="🔍 Analyze Audio",
+            command=self._analyze_audio,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 14, "bold"),
+            width=160,
+            height=40
+        )
+        self.audio_analyze_btn.pack(side="right")
+
+        # Info text
+        info_label = ctk.CTkLabel(
+            settings_frame,
+            text="Lower sensitivity = fewer detections (only strong impacts). Higher = more detections.",
+            font=("Arial", 11),
+            text_color=COLORS["accent"]
+        )
+        info_label.pack(anchor="w", padx=20, pady=(0, 10))
+
+        # ===== SECTION 3: Results =====
+        results_frame = ctk.CTkFrame(self.audio_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        results_frame.pack(fill="both", expand=True, pady=(5, 10))
+
+        results_header = ctk.CTkFrame(results_frame, fg_color="transparent")
+        results_header.pack(fill="x", padx=20, pady=(10, 5))
+
+        results_label = ctk.CTkLabel(
+            results_header,
+            text="Step 3: Review & Download Clips",
+            font=("Arial", 16, "bold"),
+            text_color=COLORS["text"]
+        )
+        results_label.pack(side="left")
+
+        self.audio_status_label = ctk.CTkLabel(
+            results_header,
+            text="Paste a YouTube URL or browse for a local file",
+            font=("Arial", 12),
+            text_color=COLORS["accent"]
+        )
+        self.audio_status_label.pack(side="right")
+
+        # Action buttons row
+        action_row = ctk.CTkFrame(results_frame, fg_color="transparent")
+        action_row.pack(fill="x", padx=20, pady=5)
+
+        self.audio_select_all_btn = ctk.CTkButton(
+            action_row, text="Select All", command=self._audio_select_all,
+            fg_color=COLORS["card_hover"], width=100, height=30
+        )
+        self.audio_select_all_btn.pack(side="left", padx=(0, 5))
+
+        self.audio_select_none_btn = ctk.CTkButton(
+            action_row, text="Select None", command=self._audio_select_none,
+            fg_color=COLORS["card_hover"], width=100, height=30
+        )
+        self.audio_select_none_btn.pack(side="left", padx=(0, 15))
+
+        # Clip duration setting
+        dur_label = ctk.CTkLabel(action_row, text="Clip padding:", font=("Arial", 12), text_color=COLORS["text"])
+        dur_label.pack(side="left", padx=(0, 5))
+
+        self.audio_clip_padding = ctk.CTkEntry(action_row, font=("Arial", 12), width=50, height=30)
+        self.audio_clip_padding.insert(0, "3")
+        self.audio_clip_padding.pack(side="left")
+
+        sec_label = ctk.CTkLabel(action_row, text="seconds (before/after impact)", font=("Arial", 11), text_color=COLORS["accent"])
+        sec_label.pack(side="left", padx=(5, 0))
+
+        self.audio_download_btn = ctk.CTkButton(
+            action_row,
+            text="📥 Download Selected Clips",
+            command=self._audio_download_clips,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 14, "bold"),
+            width=200,
+            height=35
+        )
+        self.audio_download_btn.pack(side="right")
+
+        # Scrollable results area with checkboxes
+        self.audio_results_scroll = ctk.CTkScrollableFrame(
+            results_frame,
+            fg_color=COLORS["progress_bg"]
+        )
+        self.audio_results_scroll.pack(fill="both", expand=True, padx=20, pady=(5, 20))
+
+        # State for audio detection
+        self.audio_impacts = []      # List of ImpactEvent
+        self.audio_impact_vars = {}  # {idx: BooleanVar}
+        self.audio_current_video = None  # Path to video being analyzed
+        self.audio_local_file = None     # Path to local file if selected
+
+    def _update_sens_label(self, value):
+        """Update sensitivity label when slider changes"""
+        self.audio_sens_label.configure(text=f"{float(value):.1f}")
+
+    def _audio_browse_file(self):
+        """Browse for a local video file"""
+        from tkinter import filedialog
+        file_path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[
+                ("Video files", "*.mp4 *.mkv *.avi *.mov *.webm"),
+                ("All files", "*.*")
+            ]
+        )
+        if file_path:
+            self.audio_local_file = file_path
+            self.audio_file_label.configure(text=f"Selected: {os.path.basename(file_path)}")
+            self.audio_url_entry.delete(0, "end")
+
+    def _analyze_audio(self):
+        """Analyze video for impact sounds"""
+        if not AUDIO_DETECTION_AVAILABLE:
+            messagebox.showerror("Error", "Audio detection module not available.\nInstall with: pip install librosa scipy")
+            return
+
+        # Get video source
+        url = self.audio_url_entry.get().strip()
+        local_file = self.audio_local_file
+
+        if not url and not local_file:
+            messagebox.showwarning("No Video", "Please paste a YouTube URL or select a local file")
+            return
+
+        # Get settings
+        sensitivity = self.audio_sensitivity_var.get()
+        try:
+            min_gap = float(self.audio_min_gap_entry.get().strip())
+            min_gap = max(0.1, min(5.0, min_gap))
+        except ValueError:
+            min_gap = 0.5
+
+        # Update UI
+        self.audio_analyze_btn.configure(state="disabled", text="Analyzing...")
+        self.audio_status_label.configure(text="Preparing analysis...")
+        for widget in self.audio_results_scroll.winfo_children():
+            widget.destroy()
+        self.audio_impacts = []
+        self.audio_impact_vars = {}
+        self.update()
+
+        def analyze_thread():
+            try:
+                if local_file:
+                    self.after(0, lambda: self.audio_status_label.configure(text="Analyzing local file..."))
+                    result = analyze_video(local_file, sensitivity=sensitivity, min_gap_seconds=min_gap)
+                    self.audio_current_video = local_file
+                else:
+                    self.after(0, lambda: self.audio_status_label.configure(text="Downloading video..."))
+                    result = analyze_youtube_video(url, sensitivity=sensitivity, min_gap_seconds=min_gap)
+                    if result:
+                        self.audio_current_video = result.video_path
+
+                self.after(0, lambda: self._display_audio_results(result))
+
+            except Exception as e:
+                self.after(0, lambda: self._audio_error(str(e)))
+
+        threading.Thread(target=analyze_thread, daemon=True).start()
+
+    def _display_audio_results(self, result):
+        """Display audio analysis results with checkboxes for clip selection"""
+        self.audio_analyze_btn.configure(state="normal", text="🔍 Analyze Audio")
+
+        if not result:
+            self.audio_status_label.configure(text="Analysis failed - no results")
+            return
+
+        self.audio_impacts = result.impacts
+        self.audio_status_label.configure(
+            text=f"Found {result.total_impacts} impacts in {seconds_to_timestamp(result.duration_seconds)}"
+        )
+
+        if not result.impacts:
+            no_impact_label = ctk.CTkLabel(
+                self.audio_results_scroll,
+                text="No impacts detected. Try increasing sensitivity or using a different video.",
+                font=("Arial", 12),
+                text_color=COLORS["accent"]
+            )
+            no_impact_label.pack(pady=20)
+            return
+
+        # Display each impact with checkbox
+        for idx, impact in enumerate(result.impacts):
+            var = ctk.BooleanVar(value=True)  # Selected by default
+            self.audio_impact_vars[idx] = var
+
+            frame = ctk.CTkFrame(self.audio_results_scroll, fg_color=COLORS["card_bg"], corner_radius=5)
+            frame.pack(fill="x", pady=2, padx=5)
+
+            cb = ctk.CTkCheckBox(frame, text="", variable=var, width=24)
+            cb.pack(side="left", padx=(10, 5))
+
+            time_label = ctk.CTkLabel(
+                frame,
+                text=f"[{impact.timestamp_str}]",
+                font=("Courier New", 12, "bold"),
+                text_color=COLORS["accent"],
+                width=80
+            )
+            time_label.pack(side="left", padx=5)
+
+            type_label = ctk.CTkLabel(
+                frame,
+                text=impact.event_type.upper(),
+                font=("Arial", 11, "bold"),
+                text_color="#90EE90",
+                width=60
+            )
+            type_label.pack(side="left", padx=5)
+
+            # Strength bar
+            strength_bar = "#" * int(impact.strength * 10)
+            strength_label = ctk.CTkLabel(
+                frame,
+                text=strength_bar,
+                font=("Courier New", 10),
+                text_color=COLORS["text"],
+                width=100
+            )
+            strength_label.pack(side="left", padx=5)
+
+            score_label = ctk.CTkLabel(
+                frame,
+                text=f"({impact.strength:.2f})",
+                font=("Arial", 10),
+                text_color=COLORS["accent"]
+            )
+            score_label.pack(side="left", padx=5)
+
+    def _audio_select_all(self):
+        """Select all impacts"""
+        for var in self.audio_impact_vars.values():
+            var.set(True)
+
+    def _audio_select_none(self):
+        """Deselect all impacts"""
+        for var in self.audio_impact_vars.values():
+            var.set(False)
+
+    def _audio_download_clips(self):
+        """Download selected impact clips"""
+        # Get selected impacts
+        selected_indices = [idx for idx, var in self.audio_impact_vars.items() if var.get()]
+
+        if not selected_indices:
+            messagebox.showwarning("No Selection", "Please select at least one impact to download")
+            return
+
+        if not self.audio_current_video:
+            messagebox.showerror("Error", "No video available for clip extraction")
+            return
+
+        # Get padding setting
+        try:
+            padding = float(self.audio_clip_padding.get().strip())
+            padding = max(1, min(30, padding))
+        except ValueError:
+            padding = 3
+
+        # Confirm
+        num_clips = len(selected_indices)
+        if not messagebox.askyesno("Download Clips", f"Download {num_clips} clip(s)?\nEach clip: {padding*2:.0f}s duration"):
+            return
+
+        # Update UI
+        self.audio_download_btn.configure(state="disabled", text="Extracting...")
+        self.audio_status_label.configure(text="Preparing clips...")
+        self.update()
+
+        def download_thread():
+            try:
+                self._process_audio_clips(selected_indices, padding)
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                self.after(0, lambda: self.audio_download_btn.configure(
+                    state="normal", text="📥 Download Selected Clips"
+                ))
+
+        threading.Thread(target=download_thread, daemon=True).start()
+
+    def _process_audio_clips(self, selected_indices, padding):
+        """Extract audio clips - runs in background thread"""
+        output_folder = os.path.join(DOWNLOAD_FOLDER, "audio_clips")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Create subfolder with video name
+        video_name = os.path.basename(self.audio_current_video)
+        video_name = re.sub(r'[<>:"/\\|?*]', '', video_name)[:40]
+        video_name = video_name.replace('.mp4', '').replace('.mkv', '').replace('.webm', '')
+        clip_folder = os.path.join(output_folder, video_name)
+        os.makedirs(clip_folder, exist_ok=True)
+
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            impact = self.audio_impacts[idx]
+
+            self.after(0, lambda i=i, t=total, ts=impact.timestamp_str:
+                self.audio_status_label.configure(text=f"Extracting clip {i+1}/{t}: [{ts}]...")
+            )
+
+            # Calculate clip times
+            start_time = max(0, impact.timestamp - padding)
+            duration = padding * 2
+
+            # Output filename
+            timestamp_str = impact.timestamp_str.replace(':', '-')
+            event_type = impact.event_type
+            clip_filename = f"{timestamp_str}_{event_type}_{int(duration)}s.mp4"
+            clip_path = os.path.join(clip_folder, clip_filename)
+
+            # Extract with ffmpeg (fast copy mode)
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(start_time),
+                "-i", self.audio_current_video,
+                "-t", str(duration),
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                clip_path
+            ]
+
+            try:
+                subprocess.run(ffmpeg_cmd, capture_output=True, timeout=60)
+            except:
+                # Try with re-encoding if copy fails
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss", str(start_time),
+                    "-i", self.audio_current_video,
+                    "-t", str(duration),
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-preset", "fast",
+                    clip_path
+                ]
+                try:
+                    subprocess.run(ffmpeg_cmd, capture_output=True, timeout=120)
+                except:
+                    pass
+
+        # Done
+        self.after(0, lambda: self._audio_clips_complete(clip_folder, total))
+
+    def _audio_clips_complete(self, output_folder, total):
+        """Called when clip extraction is complete"""
+        self.audio_status_label.configure(text=f"Done! {total} clips saved")
+
+        if messagebox.askyesno("Complete", f"Extracted {total} clips to:\n{output_folder}\n\nOpen folder?"):
+            os.startfile(output_folder)
+
+    def _audio_error(self, error_msg):
+        """Handle audio analysis errors"""
+        self.audio_analyze_btn.configure(state="normal", text="🔍 Analyze Audio")
+        self.audio_status_label.configure(text="Error")
+
+        error_label = ctk.CTkLabel(
+            self.audio_results_scroll,
+            text=f"Error: {error_msg}\n\nMake sure:\n- Video URL is valid or file exists\n- ffmpeg is installed\n- librosa is installed (pip install librosa)",
+            font=("Arial", 12),
+            text_color="#FF6B6B",
+            justify="left"
+        )
+        error_label.pack(pady=20, padx=20)
+
+    def _create_visual_tab(self):
+        """Create the Visual Analysis tab for detecting physical comedy actions"""
+        self.visual_tab_frame = ctk.CTkFrame(self.tab_container, fg_color="transparent")
+
+        # Initialize variables
+        self.visual_results = []
+        self.visual_clip_vars = {}
+
+        # === Step 1: Search/Input ===
+        search_frame = ctk.CTkFrame(self.visual_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        search_frame.pack(fill="x", pady=(0, 10))
+
+        step1_label = ctk.CTkLabel(
+            search_frame,
+            text="Step 1: Search for Videos or Analyze Local File",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["accent"]
+        )
+        step1_label.pack(pady=(10, 5), padx=15, anchor="w")
+
+        # Search row
+        search_row = ctk.CTkFrame(search_frame, fg_color="transparent")
+        search_row.pack(fill="x", padx=15, pady=5)
+
+        self.visual_search_entry = ctk.CTkEntry(
+            search_row,
+            placeholder_text="Search YouTube (e.g., 'Benny Hill chase scene')",
+            font=("Arial", 13),
+            height=40,
+            width=350
+        )
+        self.visual_search_entry.pack(side="left", padx=(0, 10))
+
+        # Max results field
+        ctk.CTkLabel(
+            search_row,
+            text="Max results:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(0, 5))
+
+        self.visual_max_results = ctk.CTkEntry(
+            search_row,
+            placeholder_text="10",
+            font=("Arial", 12),
+            height=40,
+            width=50
+        )
+        self.visual_max_results.insert(0, "10")
+        self.visual_max_results.pack(side="left", padx=(0, 15))
+
+        # Max duration filter (in minutes)
+        ctk.CTkLabel(
+            search_row,
+            text="Max duration:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(0, 5))
+
+        self.visual_max_duration = ctk.CTkEntry(
+            search_row,
+            placeholder_text="30",
+            font=("Arial", 12),
+            height=40,
+            width=50
+        )
+        self.visual_max_duration.insert(0, "30")
+        self.visual_max_duration.pack(side="left")
+
+        ctk.CTkLabel(
+            search_row,
+            text="min",
+            font=("Arial", 11),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(2, 10))
+
+        self.visual_search_btn = ctk.CTkButton(
+            search_row,
+            text="🔍 Search",
+            command=self._visual_search,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 13, "bold"),
+            width=100,
+            height=40
+        )
+        self.visual_search_btn.pack(side="left", padx=5)
+
+        self.visual_benny_btn = ctk.CTkButton(
+            search_row,
+            text="🎭 Get Benny Hill Videos",
+            command=self._visual_get_benny_hill,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 13, "bold"),
+            width=180,
+            height=40
+        )
+        self.visual_benny_btn.pack(side="left", padx=5)
+
+        self.visual_history_btn = ctk.CTkButton(
+            search_row,
+            text="📜 View History",
+            command=self._visual_show_history,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 13, "bold"),
+            width=130,
+            height=40
+        )
+        self.visual_history_btn.pack(side="left", padx=5)
+
+        # Local file option
+        file_row = ctk.CTkFrame(search_frame, fg_color="transparent")
+        file_row.pack(fill="x", padx=15, pady=(5, 10))
+
+        ctk.CTkLabel(file_row, text="Or local file:", font=("Arial", 12)).pack(side="left")
+
+        self.visual_file_entry = ctk.CTkEntry(
+            file_row,
+            placeholder_text="Path to video file...",
+            font=("Arial", 12),
+            height=35,
+            width=350
+        )
+        self.visual_file_entry.pack(side="left", padx=10)
+
+        ctk.CTkButton(
+            file_row,
+            text="Browse",
+            command=self._visual_browse_file,
+            fg_color=COLORS["card_hover"],
+            width=80,
+            height=35
+        ).pack(side="left")
+
+        # === Step 2: Video Selection ===
+        # Action category definitions (needed before UI but defined here for clarity)
+        self.visual_action_categories = {
+            "Slapstick Comedy": ["slapping", "faceplanting", "punching", "headbutting", "wrestling", "tickling"],
+            "Falls & Tumbles": ["faceplanting", "somersaulting", "gymnastics tumbling", "cartwheeling", "trapezing"],
+            "Fighting/Combat": ["slapping", "punching person (boxing)", "punching bag", "headbutting", "wrestling", "sword fighting", "side kick", "high kick"],
+            "Kicks": ["side kick", "high kick", "drop kicking", "kicking field goal", "kicking soccer ball"],
+            "Skating/Sliding": ["ice skating", "roller skating", "skateboarding", "skiing", "snowboarding", "water sliding", "tobogganing"],
+            "Jumping/Diving": ["jumping into pool", "bungee jumping", "diving cliff", "skydiving", "springboard diving", "high jump", "long jump"],
+            "Stunts/Parkour": ["parkour", "somersaulting", "cartwheeling", "gymnastics tumbling", "climbing", "swinging"],
+            "Dancing": ["breakdancing", "krumping", "robot dancing", "jumpstyle dancing", "capoeira"],
+            "Sports Impacts": ["dodgeball", "hitting baseball", "hockey stop", "playing ice hockey", "playing paintball"],
+        }
+
+        # === Step 2: Video Selection ===
+        selection_frame = ctk.CTkFrame(self.visual_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        selection_frame.pack(fill="x", pady=(0, 10))
+
+        step2_label = ctk.CTkLabel(
+            selection_frame,
+            text="Step 2: Select Videos to Analyze",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["accent"]
+        )
+        step2_label.pack(pady=(10, 5), padx=15, anchor="w")
+
+        # Video list scroll
+        self.visual_video_scroll = ctk.CTkScrollableFrame(
+            selection_frame,
+            fg_color=COLORS["progress_bg"],
+            height=150
+        )
+        self.visual_video_scroll.pack(fill="x", padx=15, pady=(0, 10))
+
+        self.visual_video_vars = {}
+        self.visual_videos = []
+
+        # === Step 3: Action Filter & Analyze ===
+        filter_frame = ctk.CTkFrame(self.visual_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        filter_frame.pack(fill="x", pady=(0, 10))
+
+        filter_header = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        filter_header.pack(fill="x", padx=15, pady=(10, 5))
+
+        step3_filter_label = ctk.CTkLabel(
+            filter_header,
+            text="Step 3: Choose Action Filters & Analyze",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["accent"]
+        )
+        step3_filter_label.pack(side="left")
+
+        # Min clip length next to the header
+        ctk.CTkLabel(
+            filter_header,
+            text="Min clip length:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(30, 5))
+
+        self.visual_min_duration = ctk.CTkEntry(
+            filter_header,
+            placeholder_text="5",
+            font=("Arial", 12),
+            height=30,
+            width=50
+        )
+        self.visual_min_duration.insert(0, "5")
+        self.visual_min_duration.pack(side="left")
+
+        ctk.CTkLabel(
+            filter_header,
+            text="sec",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(3, 0))
+
+        # Min confidence threshold
+        ctk.CTkLabel(
+            filter_header,
+            text="Min confidence:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(20, 5))
+
+        self.visual_min_confidence = ctk.CTkEntry(
+            filter_header,
+            placeholder_text="15",
+            font=("Arial", 12),
+            height=30,
+            width=50
+        )
+        self.visual_min_confidence.insert(0, "15")
+        self.visual_min_confidence.pack(side="left")
+
+        ctk.CTkLabel(
+            filter_header,
+            text="%",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(3, 0))
+
+        # Model selector - CLIP (default, better for slapstick) or SlowFast
+        ctk.CTkLabel(
+            filter_header,
+            text="  Model:",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        ).pack(side="left", padx=(20, 5))
+
+        self.visual_model_var = ctk.StringVar(value="CLIP (recommended)")
+        self.visual_model_dropdown = ctk.CTkOptionMenu(
+            filter_header,
+            variable=self.visual_model_var,
+            values=["CLIP (recommended)", "SlowFast"],
+            font=("Arial", 11),
+            width=150,
+            fg_color=COLORS["accent"],
+            button_color=COLORS["accent_hover"],
+            dropdown_fg_color=COLORS["card_bg"]
+        )
+        self.visual_model_dropdown.pack(side="left")
+
+        # Multi-select checkboxes for action categories
+        checkbox_frame = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        checkbox_frame.pack(fill="x", padx=15, pady=(5, 5))
+
+        self.visual_action_checkboxes = {}
+        col = 0
+        row = 0
+        max_cols = 5  # 5 checkboxes per row
+
+        for category in self.visual_action_categories.keys():
+            var = ctk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(
+                checkbox_frame,
+                text=category,
+                variable=var,
+                font=("Arial", 11),
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_hover"],
+                text_color=COLORS["text"]
+            )
+            cb.grid(row=row, column=col, padx=5, pady=2, sticky="w")
+            self.visual_action_checkboxes[category] = var
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+
+        # Select All / Clear All / Analyze buttons row
+        action_row = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        action_row.pack(fill="x", padx=15, pady=(5, 10))
+
+        ctk.CTkButton(
+            action_row,
+            text="Select All Filters",
+            command=self._visual_select_all_actions,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 11),
+            width=120,
+            height=32
+        ).pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(
+            action_row,
+            text="Clear Filters",
+            command=self._visual_clear_all_actions,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 11),
+            width=100,
+            height=32
+        ).pack(side="left", padx=(0, 20))
+
+        self.visual_analyze_btn = ctk.CTkButton(
+            action_row,
+            text="👁️ Analyze Selected Videos",
+            command=self._visual_analyze,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 14, "bold"),
+            width=220,
+            height=40
+        )
+        self.visual_analyze_btn.pack(side="left", padx=5)
+
+        self.visual_status_label = ctk.CTkLabel(
+            action_row,
+            text="Select videos above, then click Analyze",
+            font=("Arial", 12),
+            text_color=COLORS["text"]
+        )
+        self.visual_status_label.pack(side="left", padx=15)
+
+        # === Step 4: Results ===
+        results_frame = ctk.CTkFrame(self.visual_tab_frame, fg_color=COLORS["card_bg"], corner_radius=10)
+        results_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Step 4 header row with label and buttons
+        step4_header = ctk.CTkFrame(results_frame, fg_color="transparent")
+        step4_header.pack(fill="x", padx=15, pady=(10, 5))
+
+        ctk.CTkLabel(
+            step4_header,
+            text="Step 4: Detected Actions & Clips",
+            font=("Arial", 14, "bold"),
+            text_color=COLORS["accent"]
+        ).pack(side="left")
+
+        # Download buttons in header - ALWAYS VISIBLE
+        self.visual_download_btn = ctk.CTkButton(
+            step4_header,
+            text="📥 Download Selected Clips",
+            command=self._visual_download_clips,
+            fg_color=COLORS["accent"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 13, "bold"),
+            width=220,
+            height=38
+        )
+        self.visual_download_btn.pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            step4_header,
+            text="Select None",
+            command=self._visual_select_none,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 11, "bold"),
+            width=100,
+            height=34
+        ).pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            step4_header,
+            text="Select All",
+            command=self._visual_select_all,
+            fg_color=COLORS["card_hover"],
+            hover_color=COLORS["accent_hover"],
+            font=("Arial", 11, "bold"),
+            width=100,
+            height=34
+        ).pack(side="right", padx=5)
+
+        # Results scroll
+        self.visual_results_scroll = ctk.CTkScrollableFrame(
+            results_frame,
+            fg_color=COLORS["progress_bg"]
+        )
+        self.visual_results_scroll.pack(fill="both", expand=True, padx=15, pady=(5, 15))
+
+    def _visual_search(self):
+        """Search YouTube for videos"""
+        if not VISUAL_ANALYSIS_AVAILABLE:
+            messagebox.showerror("Error", "Visual analysis module not available")
+            return
+
+        query = self.visual_search_entry.get().strip()
+        if not query:
+            messagebox.showwarning("No Query", "Please enter a search query")
+            return
+
+        # Get max results from UI
+        try:
+            max_results = int(self.visual_max_results.get().strip() or "10")
+            if max_results < 1:
+                max_results = 10
+            elif max_results > 50:
+                max_results = 50  # Cap at 50
+        except ValueError:
+            max_results = 10
+
+        # Get max duration from UI (in minutes)
+        try:
+            max_duration = int(self.visual_max_duration.get().strip() or "0")
+            if max_duration < 0:
+                max_duration = 0
+        except ValueError:
+            max_duration = 0  # 0 = no limit
+
+        self.visual_search_btn.configure(state="disabled", text="Searching...")
+        self.update()
+
+        def search_thread():
+            videos = visual_search_youtube(query, max_results=max_results, max_duration_minutes=max_duration)
+            self.after(0, lambda: self._visual_display_videos(videos))
+
+        threading.Thread(target=search_thread, daemon=True).start()
+
+    def _visual_get_benny_hill(self):
+        """Get Benny Hill videos"""
+        if not VISUAL_ANALYSIS_AVAILABLE:
+            messagebox.showerror("Error", "Visual analysis module not available")
+            return
+
+        # Get max results from UI
+        try:
+            max_results = int(self.visual_max_results.get().strip() or "10")
+            if max_results < 1:
+                max_results = 10
+            elif max_results > 50:
+                max_results = 50
+        except ValueError:
+            max_results = 10
+
+        # Get max duration from UI (in minutes)
+        try:
+            max_duration = int(self.visual_max_duration.get().strip() or "0")
+            if max_duration < 0:
+                max_duration = 0
+        except ValueError:
+            max_duration = 0  # 0 = no limit
+
+        self.visual_benny_btn.configure(state="disabled", text="Loading...")
+        self.update()
+
+        def search_thread():
+            videos = get_benny_hill_videos(max_results=max_results, max_duration_minutes=max_duration)
+            self.after(0, lambda: self._visual_display_videos(videos))
+
+        threading.Thread(target=search_thread, daemon=True).start()
+
+    def _visual_show_history(self):
+        """Show previously analyzed videos from database"""
+        print("[UI-VISUAL] View History clicked")
+        if not VISUAL_ANALYSIS_AVAILABLE:
+            messagebox.showerror("Error", "Visual analysis module not available")
+            return
+
+        db = load_processed_database()
+        print(f"[UI-VISUAL] Database has {len(db['videos'])} videos")
+
+        if not db["videos"]:
+            messagebox.showinfo("No History", "No videos have been analyzed yet.\n\nSearch for videos or load Benny Hill collection to start analyzing.")
+            return
+
+        # Print summary of what's in the database
+        for vid_hash, data in db['videos'].items():
+            print(f"[UI-VISUAL] History: {data.get('video_title', 'Unknown')[:40]} - {data.get('total_detections', 0)} detections")
+
+        # Clear current results and show history
+        for widget in self.visual_results_scroll.winfo_children():
+            widget.destroy()
+        self.visual_clip_vars = {}
+
+        # Convert database entries to result format
+        all_results = []
+        for video_hash, data in db["videos"].items():
+            # Create video dict
+            video = {
+                "url": data["video_url"],
+                "title": data["video_title"],
+                "id": data["video_id"]
+            }
+
+            # Create result-like object
+            class HistoryResult:
+                def __init__(self, d):
+                    self.video_id = d["video_id"]
+                    self.video_url = d["video_url"]
+                    self.video_title = d["video_title"]
+                    self.duration_seconds = d["duration_seconds"]
+                    self.analyzed_date = d["analyzed_date"]
+                    self.total_detections = d["total_detections"]
+                    self.detections = d["detections"]
+                    self.analysis_params = d["analysis_params"]
+
+            result = HistoryResult(data)
+            all_results.append({
+                "video": video,
+                "result": result
+            })
+
+        # Sort by analyzed date (newest first)
+        all_results.sort(key=lambda x: x["result"].analyzed_date, reverse=True)
+
+        self.visual_results = all_results
+        total_detections = sum(r["result"].total_detections for r in all_results)
+
+        self.visual_status_label.configure(
+            text=f"📜 History: {len(all_results)} videos, {total_detections} total actions detected"
+        )
+
+        # Display results using the same format
+        clip_id = 0
+        for result_data in all_results:
+            video = result_data["video"]
+            result = result_data["result"]
+
+            # Video header with date
+            video_frame = ctk.CTkFrame(self.visual_results_scroll, fg_color=COLORS["card_bg"], corner_radius=8)
+            video_frame.pack(fill="x", pady=5)
+
+            title_text = video["title"][:45] + ("..." if len(video["title"]) > 45 else "")
+            date_str = result.analyzed_date[:10] if result.analyzed_date else "Unknown"
+
+            header_frame = ctk.CTkFrame(video_frame, fg_color="transparent")
+            header_frame.pack(fill="x", pady=(8, 5), padx=10)
+
+            ctk.CTkLabel(
+                header_frame,
+                text=f"🎬 {title_text}",
+                font=("Arial", 13, "bold"),
+                text_color=COLORS["text"]
+            ).pack(side="left")
+
+            ctk.CTkLabel(
+                header_frame,
+                text=f"[{date_str}] {result.total_detections} actions",
+                font=("Arial", 11),
+                text_color=COLORS["accent"]
+            ).pack(side="right")
+
+            if not result.detections:
+                ctk.CTkLabel(
+                    video_frame,
+                    text="  No physical comedy actions detected",
+                    font=("Arial", 11),
+                    text_color="#FFB347"
+                ).pack(pady=(0, 8), padx=10, anchor="w")
+                continue
+
+            # Show each detection
+            for det in result.detections:
+                clip_frame = ctk.CTkFrame(video_frame, fg_color=COLORS["progress_bg"], corner_radius=5)
+                clip_frame.pack(fill="x", padx=10, pady=2)
+
+                var = ctk.BooleanVar(value=False)  # Default to unchecked for history
+                self.visual_clip_vars[clip_id] = {
+                    "var": var,
+                    "video": video,
+                    "detection": det,
+                    "result": result
+                }
+
+                cb = ctk.CTkCheckBox(clip_frame, text="", variable=var, width=24)
+                cb.pack(side="left", padx=5)
+
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=f"[{det['timestamp_str']}]",
+                    font=("Courier New", 11, "bold"),
+                    text_color=COLORS["accent"],
+                    width=80
+                ).pack(side="left", padx=5)
+
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=det["action_class"].upper(),
+                    font=("Arial", 11, "bold"),
+                    text_color="#90EE90",
+                    width=150
+                ).pack(side="left", padx=5)
+
+                conf_bar = "#" * int(det["confidence"] * 10)
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=f"{conf_bar} ({det['confidence']:.2f})",
+                    font=("Arial", 10),
+                    text_color=COLORS["text"]
+                ).pack(side="left", padx=5)
+
+                clip_id += 1
+
+            ctk.CTkFrame(video_frame, fg_color="transparent", height=5).pack()
+
+    def _visual_display_videos(self, videos):
+        """Display found videos with checkboxes"""
+        self.visual_search_btn.configure(state="normal", text="🔍 Search")
+        self.visual_benny_btn.configure(state="normal", text="🎭 Get Benny Hill Videos")
+
+        # Clear old
+        for widget in self.visual_video_scroll.winfo_children():
+            widget.destroy()
+        self.visual_video_vars = {}
+        self.visual_videos = videos
+
+        # Check which are already processed
+        db = load_processed_database() if VISUAL_ANALYSIS_AVAILABLE else {"videos": {}}
+
+        for i, video in enumerate(videos):
+            row = ctk.CTkFrame(self.visual_video_scroll, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+
+            var = ctk.BooleanVar(value=True)
+            self.visual_video_vars[i] = var
+
+            # Check if processed
+            from visual_analysis import get_video_hash
+            video_hash = get_video_hash(video["url"])
+            is_processed = video_hash in db["videos"]
+
+            cb = ctk.CTkCheckBox(row, text="", variable=var, width=24)
+            cb.pack(side="left", padx=5)
+
+            # Status: Previously analyzed (can re-analyze) or New
+            if is_processed:
+                status = "Previously analyzed - will re-analyze with current filters"
+                status_color = "#FFD700"  # Gold/yellow to indicate re-run
+            else:
+                status = "New"
+                status_color = COLORS["accent"]
+
+            title_text = video["title"][:45] + ("..." if len(video["title"]) > 45 else "")
+            dur = int(video.get('duration', 0) or 0)
+            duration_str = f"{dur // 60}:{dur % 60:02d}"
+
+            ctk.CTkLabel(
+                row,
+                text=f"{title_text} ({duration_str})",
+                font=("Arial", 11),
+                text_color=COLORS["text"]
+            ).pack(side="left", padx=5)
+
+            ctk.CTkLabel(
+                row,
+                text=f"[{status}]",
+                font=("Arial", 10),
+                text_color=status_color
+            ).pack(side="left", padx=5)
+
+        self.visual_status_label.configure(text=f"Found {len(videos)} videos")
+
+    def _visual_browse_file(self):
+        """Browse for local video file"""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[("Video files", "*.mp4 *.mkv *.avi *.mov *.webm"), ("All files", "*.*")]
+        )
+        if path:
+            self.visual_file_entry.delete(0, 'end')
+            self.visual_file_entry.insert(0, path)
+
+    def _visual_select_all_actions(self):
+        """Select all action filter checkboxes"""
+        for var in self.visual_action_checkboxes.values():
+            var.set(True)
+
+    def _visual_clear_all_actions(self):
+        """Clear all action filter checkboxes"""
+        for var in self.visual_action_checkboxes.values():
+            var.set(False)
+
+    def _visual_get_selected_actions(self):
+        """Get combined list of action keywords from selected categories"""
+        action_keywords = []
+        for category, var in self.visual_action_checkboxes.items():
+            if var.get():
+                keywords = self.visual_action_categories.get(category, [])
+                for kw in keywords:
+                    if kw not in action_keywords:
+                        action_keywords.append(kw)
+        return action_keywords
+
+    def _visual_analyze(self):
+        """Analyze selected videos"""
+        if not VISUAL_ANALYSIS_AVAILABLE:
+            messagebox.showerror("Error", "Visual analysis module not available")
+            return
+
+        # Get selected videos
+        selected = []
+        for i, var in self.visual_video_vars.items():
+            if var.get() and i < len(self.visual_videos):
+                selected.append(self.visual_videos[i])
+
+        # Also check local file
+        local_file = self.visual_file_entry.get().strip()
+        if local_file and os.path.exists(local_file):
+            selected.append({
+                "url": local_file,
+                "title": os.path.basename(local_file),
+                "id": "local"
+            })
+
+        if not selected:
+            messagebox.showwarning("No Videos", "Please select videos to analyze or enter a local file path")
+            return
+
+        self.visual_analyze_btn.configure(state="disabled", text="Analyzing...")
+        self.visual_status_label.configure(text=f"Analyzing {len(selected)} video(s)...")
+        self.update()
+
+        # Clear results
+        for widget in self.visual_results_scroll.winfo_children():
+            widget.destroy()
+        self.visual_results = []
+        self.visual_clip_vars = {}
+
+        # Get filter parameters from UI (from multi-select checkboxes)
+        action_keywords = self._visual_get_selected_actions()
+
+        try:
+            min_duration = float(self.visual_min_duration.get().strip() or "5")
+        except ValueError:
+            min_duration = 5.0
+
+        try:
+            min_confidence = float(self.visual_min_confidence.get().strip() or "15") / 100.0
+            if min_confidence < 0.01:
+                min_confidence = 0.01
+            elif min_confidence > 0.99:
+                min_confidence = 0.99
+        except ValueError:
+            min_confidence = 0.15  # 15% default
+
+        # Get selected model
+        model_selection = self.visual_model_var.get()
+        model = "clip" if "CLIP" in model_selection else "slowfast"
+
+        def analyze_thread():
+            all_results = []
+            total = len(selected)
+            print(f"[UI-VISUAL] Starting analysis of {total} video(s)")
+            print(f"[UI-VISUAL] Model: {model}")
+            print(f"[UI-VISUAL] Action keywords: {action_keywords}")
+            print(f"[UI-VISUAL] Min clip duration: {min_duration}s")
+            print(f"[UI-VISUAL] Min confidence: {min_confidence*100:.0f}%")
+
+            for i, video in enumerate(selected):
+                print(f"[UI-VISUAL] Analyzing video {i+1}/{total}: {video['title'][:50]}")
+                print(f"[UI-VISUAL] URL: {video['url'][:80]}")
+                self.after(0, lambda i=i, v=video: self.visual_status_label.configure(
+                    text=f"Analyzing {i+1}/{total}: {v['title'][:35]}..."
+                ))
+
+                try:
+                    result = visual_analyze_video(
+                        video["url"],
+                        video["title"],
+                        fps=2.0,
+                        threshold=min_confidence,  # From UI input
+                        force_reprocess=True,  # Always re-analyze when user selects
+                        action_keywords=action_keywords,
+                        min_clip_duration=min_duration,
+                        model=model  # CLIP (default) or SlowFast
+                    )
+                    if result:
+                        print(f"[UI-VISUAL] Result: {result.total_detections} clips")
+                        all_results.append({
+                            "video": video,
+                            "result": result
+                        })
+                    else:
+                        print(f"[UI-VISUAL] Result was None for {video['title']}")
+                except Exception as e:
+                    print(f"[UI-VISUAL] Error analyzing {video['title']}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            print(f"[UI-VISUAL] Analysis complete. Total results: {len(all_results)}")
+
+            self.after(0, lambda: self._visual_display_results(all_results))
+
+        threading.Thread(target=analyze_thread, daemon=True).start()
+
+    def _visual_display_results(self, all_results):
+        """Display analysis results"""
+        print(f"[UI-VISUAL] Displaying {len(all_results)} results")
+        self.visual_analyze_btn.configure(state="normal", text="👁️ Analyze Selected Videos")
+        self.visual_results = all_results
+
+        # Use len(detections) for accurate count after filtering
+        total_detections = sum(len(r["result"].detections) for r in all_results)
+        print(f"[UI-VISUAL] Total detections across all videos: {total_detections}")
+        for r in all_results:
+            det_count = len(r["result"].detections)
+            print(f"[UI-VISUAL]   - {r['video']['title'][:40]}: {det_count} detections")
+        self.visual_status_label.configure(
+            text=f"Found {total_detections} actions in {len(all_results)} video(s)"
+        )
+
+        # Clear old results
+        for widget in self.visual_results_scroll.winfo_children():
+            widget.destroy()
+        self.visual_clip_vars = {}
+
+        clip_id = 0
+        for result_data in all_results:
+            video = result_data["video"]
+            result = result_data["result"]
+
+            # Video header
+            video_frame = ctk.CTkFrame(self.visual_results_scroll, fg_color=COLORS["card_bg"], corner_radius=8)
+            video_frame.pack(fill="x", pady=5)
+
+            title_text = video["title"][:50] + ("..." if len(video["title"]) > 50 else "")
+            det_count = len(result.detections)
+            ctk.CTkLabel(
+                video_frame,
+                text=f"🎬 {title_text} - {det_count} actions detected",
+                font=("Arial", 13, "bold"),
+                text_color=COLORS["text"]
+            ).pack(pady=(8, 5), padx=10, anchor="w")
+
+            if not result.detections:
+                ctk.CTkLabel(
+                    video_frame,
+                    text="  No physical comedy actions detected",
+                    font=("Arial", 11),
+                    text_color="#FFB347"
+                ).pack(pady=(0, 8), padx=10, anchor="w")
+                continue
+
+            # Show each clip (with duration)
+            for det in result.detections:
+                clip_frame = ctk.CTkFrame(video_frame, fg_color=COLORS["progress_bg"], corner_radius=5)
+                clip_frame.pack(fill="x", padx=10, pady=2)
+
+                var = ctk.BooleanVar(value=True)
+                self.visual_clip_vars[clip_id] = {
+                    "var": var,
+                    "video": video,
+                    "detection": det,
+                    "result": result
+                }
+
+                cb = ctk.CTkCheckBox(clip_frame, text="", variable=var, width=24)
+                cb.pack(side="left", padx=5)
+
+                # Show time range if available, otherwise just timestamp
+                if "end_str" in det and "duration" in det:
+                    time_text = f"[{det['timestamp_str']} - {det['end_str']}] ({det['duration']:.0f}s)"
+                else:
+                    time_text = f"[{det['timestamp_str']}]"
+
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=time_text,
+                    font=("Courier New", 11, "bold"),
+                    text_color=COLORS["accent"],
+                    width=180
+                ).pack(side="left", padx=5)
+
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=det["action_class"].upper(),
+                    font=("Arial", 11, "bold"),
+                    text_color="#90EE90",
+                    width=150
+                ).pack(side="left", padx=5)
+
+                conf_bar = "#" * int(det["confidence"] * 10)
+                ctk.CTkLabel(
+                    clip_frame,
+                    text=f"{conf_bar} ({det['confidence']:.2f})",
+                    font=("Arial", 10),
+                    text_color=COLORS["text"]
+                ).pack(side="left", padx=5)
+
+                clip_id += 1
+
+            ctk.CTkFrame(video_frame, fg_color="transparent", height=5).pack()
+
+    def _visual_select_all(self):
+        """Select all detected clips"""
+        for data in self.visual_clip_vars.values():
+            data["var"].set(True)
+
+    def _visual_select_none(self):
+        """Deselect all detected clips"""
+        for data in self.visual_clip_vars.values():
+            data["var"].set(False)
+
+    def _visual_download_clips(self):
+        """Download selected clips"""
+        selected = []
+        for clip_id, data in self.visual_clip_vars.items():
+            if data["var"].get():
+                selected.append(data)
+
+        if not selected:
+            messagebox.showwarning("No Clips", "Please select clips to download")
+            return
+
+        result = messagebox.askyesno(
+            "Download Clips",
+            f"Download {len(selected)} clip(s)?\n\nEach clip will be ~10 seconds around the detected action."
+        )
+
+        if not result:
+            return
+
+        self.visual_download_btn.configure(state="disabled", text="Downloading...")
+        self.visual_status_label.configure(text="Downloading clips...")
+        self.update()
+
+        def download_thread():
+            output_folder = os.path.join(DOWNLOAD_FOLDER, "visual_clips")
+            os.makedirs(output_folder, exist_ok=True)
+
+            for i, data in enumerate(selected):
+                video = data["video"]
+                det = data["detection"]
+                result = data["result"]
+
+                self.after(0, lambda i=i: self.visual_status_label.configure(
+                    text=f"Downloading clip {i+1}/{len(selected)}..."
+                ))
+
+                try:
+                    # Download video if needed
+                    video_url = video["url"]
+                    is_local = os.path.exists(video_url)
+
+                    if is_local:
+                        temp_video = video_url
+                    else:
+                        temp_video = os.path.join(TEMP_FOLDER, f"{video.get('id', 'temp')}_temp.mp4")
+                        os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+                        if not os.path.exists(temp_video):
+                            cmd = [
+                                "yt-dlp",
+                                "-f", "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
+                                "-o", temp_video,
+                                "--no-playlist",
+                                "--merge-output-format", "mp4",
+                                "--cookies-from-browser", "firefox",
+                                video_url
+                            ]
+                            print(f"[VISUAL] Downloading video for clip extraction...")
+                            subprocess.run(cmd, capture_output=True, timeout=300)
+
+                    if os.path.exists(temp_video):
+                        # Extract clip - use actual clip duration if available
+                        start_time = det.get("timestamp", 0)
+                        if "duration" in det:
+                            clip_duration = det["duration"]
+                        elif "end_time" in det:
+                            clip_duration = det["end_time"] - start_time
+                        else:
+                            # Fallback: 10 seconds centered on timestamp
+                            start_time = max(0, det["timestamp"] - 5)
+                            clip_duration = 10
+
+                        safe_action = det["action_class"].replace(" ", "_")[:20]
+                        safe_title = video["title"].replace(" ", "_")[:30]
+                        clip_name = f"{safe_title}_{det['timestamp_str'].replace(':', '-')}_{safe_action}_{clip_duration:.0f}s.mp4"
+                        clip_path = os.path.join(output_folder, clip_name)
+
+                        ffmpeg_cmd = [
+                            "ffmpeg", "-y",
+                            "-ss", str(start_time),
+                            "-i", temp_video,
+                            "-t", str(clip_duration),
+                            "-c", "copy",
+                            clip_path
+                        ]
+                        subprocess.run(ffmpeg_cmd, capture_output=True, timeout=60)
+                        print(f"[VISUAL] Extracted clip: {clip_name} ({clip_duration:.0f}s)")
+
+                    # Cleanup temp video if not local
+                    if not is_local and os.path.exists(temp_video):
+                        try:
+                            os.remove(temp_video)
+                        except:
+                            pass
+
+                except Exception as e:
+                    print(f"[VISUAL] Error downloading clip: {e}")
+
+            self.after(0, lambda: self._visual_download_complete(output_folder, len(selected)))
+
+        threading.Thread(target=download_thread, daemon=True).start()
+
+    def _visual_download_complete(self, output_folder, count):
+        """Handle download completion"""
+        self.visual_download_btn.configure(state="normal", text="📥 Download Selected Clips")
+        self.visual_status_label.configure(text=f"Done! {count} clips saved")
+
+        if messagebox.askyesno("Download Complete", f"Downloaded {count} clips to:\n{output_folder}\n\nOpen folder?"):
+            os.startfile(output_folder)
+
     def switch_tab(self, tab_name: str):
-        """Switch between URL and Search tabs"""
+        """Switch between URL, Search, Audio Detection, and Visual Analysis tabs"""
         if tab_name == self.current_tab:
             return
 
@@ -1381,17 +3157,29 @@ class QuickTubeApp(ctk.CTk):
         if self.current_tab == "url":
             self.url_tab_frame.pack_forget()
             self.url_tab_btn.configure(fg_color=COLORS["card_bg"])
-        else:
+        elif self.current_tab == "search":
             self.search_tab_frame.pack_forget()
             self.search_tab_btn.configure(fg_color=COLORS["card_bg"])
+        elif self.current_tab == "audio":
+            self.audio_tab_frame.pack_forget()
+            self.audio_tab_btn.configure(fg_color=COLORS["card_bg"])
+        elif self.current_tab == "visual":
+            self.visual_tab_frame.pack_forget()
+            self.visual_tab_btn.configure(fg_color=COLORS["card_bg"])
 
         # Show new tab
         if tab_name == "url":
             self.url_tab_frame.pack(fill="both", expand=True)
             self.url_tab_btn.configure(fg_color=COLORS["accent"])
-        else:
+        elif tab_name == "search":
             self.search_tab_frame.pack(fill="both", expand=True)
             self.search_tab_btn.configure(fg_color=COLORS["accent"])
+        elif tab_name == "audio":
+            self.audio_tab_frame.pack(fill="both", expand=True)
+            self.audio_tab_btn.configure(fg_color=COLORS["accent"])
+        elif tab_name == "visual":
+            self.visual_tab_frame.pack(fill="both", expand=True)
+            self.visual_tab_btn.configure(fg_color=COLORS["accent"])
 
         self.current_tab = tab_name
 
@@ -1813,14 +3601,15 @@ class QuickTubeApp(ctk.CTk):
 
             # Download 30 seconds starting from 10 seconds in (to skip intros)
             # Using yt-dlp with download-sections
+            preview_base = os.path.join(TEMP_FOLDER, f"preview_{video_id}")
             cmd = [
                 "yt-dlp",
                 "--download-sections", "*10-40",  # 30 seconds from 10s to 40s
-                "-f", "bv*[height<=480]+ba/b[height<=480]/b",  # Lower quality for quick preview
-                "-o", preview_file,
+                "-f", "b[height<=480]/bv*[height<=480]+ba/b",  # Lower quality for quick preview
+                "-o", f"{preview_base}.%(ext)s",
+                "--merge-output-format", "mp4",  # Force MP4 output
                 "--no-playlist",
-                "--quiet",
-                "--no-warnings",
+                "--force-overwrites",
             ]
             cmd.extend(self._get_cookie_args())
             cmd.append(video_url)
@@ -1830,24 +3619,26 @@ class QuickTubeApp(ctk.CTk):
             # Run yt-dlp
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-            if result.returncode == 0 and os.path.exists(preview_file):
-                self.after(0, lambda: self._play_video_file(preview_file))
+            # Look for the downloaded file (may have different extension)
+            import glob
+            preview_files = glob.glob(f"{preview_base}.*")
+
+            if result.returncode == 0 and preview_files:
+                actual_file = preview_files[0]
+                logger.info(f"Preview downloaded: {actual_file}")
+                self.after(0, lambda f=actual_file: self._play_video_file(f))
             else:
-                # Fallback: open in browser at 10 second mark
-                logger.warning(f"Preview download failed, opening in browser. Error: {result.stderr}")
-                fallback_url = f"https://www.youtube.com/watch?v={video_id}&t=10"
-                self.after(0, lambda: webbrowser.open(fallback_url))
+                # Show error - don't open browser
+                error_msg = result.stderr[:200] if result.stderr else "Unknown error"
+                logger.error(f"Preview download failed: {error_msg}")
+                self.after(0, lambda: messagebox.showerror("Preview Error", f"Could not download preview clip.\n\n{error_msg}"))
 
         except subprocess.TimeoutExpired:
             logger.error("Preview download timed out")
-            # Fallback to browser
-            fallback_url = f"https://www.youtube.com/watch?v={self.preview_video['id']}&t=10"
-            self.after(0, lambda: webbrowser.open(fallback_url))
+            self.after(0, lambda: messagebox.showerror("Preview Error", "Download timed out. Try again."))
         except Exception as e:
             logger.error(f"Preview error: {e}")
-            # Fallback to browser
-            fallback_url = f"https://www.youtube.com/watch?v={self.preview_video['id']}&t=10"
-            self.after(0, lambda: webbrowser.open(fallback_url))
+            self.after(0, lambda: messagebox.showerror("Preview Error", f"Error: {e}"))
         finally:
             # Re-enable button
             self.after(0, lambda: self.preview_play_btn.configure(state="normal", text="▶ Play 30s Preview"))
@@ -2115,7 +3906,7 @@ class QuickTubeApp(ctk.CTk):
         thread.start()
 
     def download_channel(self):
-        """Download all videos from channel"""
+        """Download videos from channel with user-specified limit"""
         url = self.url_entry.get().strip()
         if not url:
             messagebox.showwarning("No URL", "Please paste a YouTube channel URL first")
@@ -2125,16 +3916,41 @@ class QuickTubeApp(ctk.CTk):
         if not self._ensure_youtube_login():
             return
 
-        # Confirm channel download
+        # Ask how many videos to download
+        dialog = ctk.CTkInputDialog(
+            text="How many videos to download?\n(Enter a number, or 'all' for entire channel)",
+            title="Download Channel"
+        )
+        result = dialog.get_input()
+
+        if not result:
+            return  # User cancelled
+
+        result = result.strip().lower()
+        if result == "all":
+            max_videos = None  # No limit
+            confirm_msg = "This will download ALL videos from the channel."
+        else:
+            try:
+                max_videos = int(result)
+                if max_videos <= 0:
+                    messagebox.showwarning("Invalid Number", "Please enter a positive number")
+                    return
+                confirm_msg = f"This will download up to {max_videos} videos from the channel."
+            except ValueError:
+                messagebox.showwarning("Invalid Input", "Please enter a number or 'all'")
+                return
+
+        # Confirm
         response = messagebox.askyesno(
             "Download Channel",
-            "This will download ALL videos from the channel. This may take a long time. Continue?"
+            f"{confirm_msg}\n\nThis may take a while. Continue?"
         )
         if not response:
             return
 
         # Start download in thread
-        thread = threading.Thread(target=self._download_channel_thread, args=(url,))
+        thread = threading.Thread(target=self._download_channel_thread, args=(url, max_videos))
         thread.daemon = True
         thread.start()
 
@@ -2415,13 +4231,17 @@ class QuickTubeApp(ctk.CTk):
                     pass
             self.is_downloading = False
 
-    def _download_channel_thread(self, url):
-        """Download entire channel in separate thread"""
+    def _download_channel_thread(self, url, max_videos=None):
+        """Download channel in separate thread with optional video limit"""
         try:
             self.is_downloading = True
             self.log_message(f"\n[START] Downloading channel...")
             self.log_message(f"[URL] {url}")
             self.log_message(f"[FOLDER] {DOWNLOAD_FOLDER}")
+            if max_videos:
+                self.log_message(f"[LIMIT] Downloading up to {max_videos} videos")
+            else:
+                self.log_message(f"[LIMIT] Downloading ALL videos")
             self.log_message(f"[INFO] This may take a while...\n")
 
             # Build yt-dlp command for channel
@@ -2437,7 +4257,12 @@ class QuickTubeApp(ctk.CTk):
                 "--merge-output-format", self.settings.get("output_format", "mp4"),  # Force mp4 output
                 # YouTube extraction requires JavaScript runtime
                 "--js-runtimes", f"node:{node_path}" if node_path else "node",
-                            ]
+            ]
+
+            # Add video limit if specified
+            if max_videos:
+                cmd.extend(["--playlist-end", str(max_videos)])
+
             cmd.extend(self._get_cookie_args())
             cmd.append(url)
 
@@ -3344,6 +5169,50 @@ class QuickTubeApp(ctk.CTk):
 
 def main():
     """Main entry point"""
+    import atexit
+
+    # Check if another instance is already running
+    is_running, existing_pid = check_single_instance()
+
+    if is_running:
+        # Create a simple dialog to ask user what to do
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()  # Hide the root window
+
+        response = messagebox.askyesno(
+            "QuickTube Already Running",
+            f"QuickTube is already running (PID: {existing_pid}).\n\n"
+            "Do you want to close the existing instance and start a new one?",
+            icon='warning'
+        )
+
+        if response:
+            # User wants to kill existing instance
+            if kill_existing_instance(existing_pid):
+                # Create new lock file for this instance
+                with open(LOCK_FILE, 'w') as f:
+                    f.write(str(os.getpid()))
+            else:
+                messagebox.showerror(
+                    "Error",
+                    "Could not close the existing instance.\n"
+                    "Please close it manually and try again."
+                )
+                root.destroy()
+                return
+        else:
+            # User doesn't want to close - just exit
+            root.destroy()
+            return
+
+        root.destroy()
+
+    # Register cleanup on exit
+    atexit.register(remove_lock_file)
+
     # Verify download folder exists
     if not os.path.exists(DOWNLOAD_FOLDER):
         os.makedirs(DOWNLOAD_FOLDER)

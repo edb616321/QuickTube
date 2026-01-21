@@ -23,6 +23,15 @@ QuickTube is a simple, clean YouTube downloader with a GUI interface. Just paste
 - **Batch Selection** - Select multiple videos to download at once
 - **Open Folder Button** - Quick access to downloads folder in tab bar
 
+### Visual Analysis Tab (New in 2026-01-21)
+- **AI-Powered Physical Comedy Detection** - Detect falls, slaps, chases, slapstick
+- **CLIP Model (Recommended)** - Semantic matching for slapstick comedy (29% accuracy on Benny Hill)
+- **SlowFast Model (Optional)** - Kinetics-400 action recognition
+- **Multi-Select Action Filters** - Choose categories: Slapstick, Falls, Fighting, Chases, etc.
+- **Configurable Thresholds** - Min clip length, min confidence, max duration
+- **Download Detected Clips** - Save clips directly to `visual_clips` folder
+- **Re-Analyze Support** - Previously analyzed videos can be re-processed with new filters
+
 ### Codec Compatibility (Added 2025-12)
 - **Automatic Codec Detection** - Scans downloads using FFprobe
 - **Compatibility Warnings** - Alerts for problematic files (Opus audio, VP9/AV1 video)
@@ -137,7 +146,56 @@ When a compatibility issue is detected, QuickTube offers:
 2. **Skip** - Keep the file as-is (works on computer)
 3. **Auto-Convert** - Enable in settings to always convert problematic files
 
+## Visual Analysis - How It Works
+
+The Visual Analysis tab uses AI to detect physical comedy moments in videos.
+
+### Workflow
+1. **Search** - Enter a search query (e.g., "benny hill slapstick") or browse local files
+2. **Select Videos** - Check videos to analyze (can re-analyze previously processed)
+3. **Set Filters** - Choose action categories, min clip length (5s default), min confidence (15%)
+4. **Choose Model** - CLIP (recommended) or SlowFast
+5. **Analyze** - AI processes videos and detects comedy moments
+6. **Download** - Select clips and save to `D:\stacher_downloads\visual_clips\`
+
+### Detection Models
+
+| Model | Best For | How It Works |
+|-------|----------|--------------|
+| **CLIP** | Slapstick comedy, semantic concepts | Matches frames to text descriptions like "person slapping someone" |
+| SlowFast | Sports actions, specific movements | Kinetics-400 trained action recognition |
+
+### CLIP Detection Categories (23 prompts)
+- **Slapstick**: "slapstick comedy scene", "person slapping another person", "comedic fighting"
+- **Falls**: "person falling down", "someone tripping", "faceplanting", "pratfall"
+- **Chases**: "people running and chasing", "comedy chase scene", "fast motion chase"
+- **Physical Humor**: "pie in face", "being pushed", "knocked over", "silly movements"
+
+### Requirements for Visual Analysis
+```bash
+# Separate conda environment required
+conda create -n video_analysis python=3.10
+conda activate video_analysis
+pip install torch torchvision pytorchvideo pillow numpy
+pip install git+https://github.com/openai/CLIP.git
+```
+
 ## Recent Updates
+
+### 2026-01-21 - Visual Analysis CLIP Integration
+- **Added CLIP model** - Much better slapstick detection (29% vs 0.27% for SlowFast)
+- **Removed clip merging** - Each detection is individual, not merged together
+- **Fixed re-analysis** - Previously analyzed videos now re-analyze when selected
+- **Fixed min duration filter** - Short clips are now skipped, not extended
+- **Fixed download buttons** - Moved to Step 4 header, always visible
+- **Model selector dropdown** - Choose between CLIP (recommended) and SlowFast
+
+### 2026-01-20 - Visual Analysis Tab Added
+- New tab for AI-powered physical comedy detection
+- Multi-select action category filters
+- Max results and max duration search filters
+- Min confidence threshold filtering
+- Download detected clips feature
 
 ### 2026-01-09 - Embedded Video Preview
 - Added embedded VLC player for preview clips
@@ -189,10 +247,13 @@ D:\stacher_downloads\
 ```
 D:\QuickTube\
 ├── quicktube.py           # Main application
+├── visual_analysis.py     # Visual analysis module (CLIP + SlowFast)
+├── audio_detection.py     # Audio detection module
 ├── codec_utils.py         # Codec detection utilities
 ├── settings.json          # User preferences
 ├── download_history.json  # Download history
-├── temp/                  # Temporary download folder
+├── processed_videos.json  # Visual analysis cache
+├── temp/                  # Temporary download/frame folder
 ├── logs/                  # Application logs
 ├── README.md              # This file
 └── FIXES.md               # Bug fix documentation
